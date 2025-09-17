@@ -1,0 +1,1619 @@
+import re
+import numpy as np
+import pandas as pd
+from datetime import datetime
+import argparse
+import json
+import os, sys, subprocess
+from matplotlib.backends.backend_pdf import PdfPages
+from textwrap import shorten
+import matplotlib.pyplot as plt
+plt.ioff()
+
+
+# ===================== CONFIG =====================
+FILENAME        = "550.csv"
+SOURCE_FOLDER   = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Project\FY2026 plan\Stats Tests"
+timestamp       = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Exports
+SUMMARY_CSV     = f"Rescue_Summary_{timestamp}.csv"
+ZMOVE_CSV       = f"Zone_Movement_By_ComboZone_{timestamp}.csv"
+CUR_CSV         = f"CurrentZone_Movement_By_Combo_{timestamp}.csv"
+REC_CSV         = f"RecZone_Movement_By_Combo_{timestamp}.csv"
+TRANS_CSV       = f"Customer_Zone_Transitions_{timestamp}.csv"
+
+# Evidence thresholds
+EVID_SWITCH_MIN = 20   # >=20 → Switch
+EVID_PILOT_MIN  = 5    # 5..19 → Pilot; <5 → Investigate
+
+# Price rules
+EXCLUDE_ZONE_ZERO = True
+NEVER_UPZONE      = True
+
+# Reactive downshift threshold
+REACTIVE_DOWN_CONTRACTED_THRESH = 0.50
+
+# Rescue priority weights
+PRIO_WEIGHTS = {
+    "BleedComp": 1.00,
+    "LossMag":   0.75,
+    "Active":    0.50,
+    "Size":      0.25,
+}
+
+# Loss attack controls
+LOSS_ATTACK_PCT      = 0.80   # top 20% worst loss by percentile
+LOSS_ATTACK_MIN_LBS  = 2_000  # or >= this absolute YoY loss
+
+# ===== NEXT STEPS PDF CONFIG =====
+MAKE_NEXT_STEPS_PDF = True
+TOP_K_ACTIONS = 15                     # how many “do first” rows to list
+FILTER_REGION = None                   # e.g. "South Texas"
+FILTER_COMPANY = None                  # e.g. "Houston"
+NEXT_STEPS_PDF = f"Next_Steps_{timestamp}.pdf"
+# Default action labels (module-level so any function can read them)
+ACTION_CHANGE = "Change"
+ACTION_KEEP   = "Keep"
+
+# ===================================================
+
+PDF_DISPLAY_COLS = [
+    "Rescue Priority Rank",
+    "Combo Key",
+    "Company Region Name",
+    "Company Name",
+    "Current Zone Suffix",
+    "Recommended Zone Suffix",
+    "Rec_Action",
+    "Evidence_Bucket",
+    "LossMag",
+    "Rec_GrowthShare",
+    "Rec_RepeatShare",
+    "Rec_BleedRate",
+    "Movers_Share_of_Base",
+    "Reactive_Downshift_Likely"
+]
+
+
+def _format_number(v):
+    try:
+        x = float(v)
+        return f"{x:,.0f}"
+    except Exception:
+        return ""
+
+def _format_percent(v, digits=1):
+    try:
+        x = float(v)
+        return f"{x*100:.{digits}f}%"
+    except Exception:
+        return ""
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="KSM zone rescue")
+    ap.add_argument("--config", default="config.json",
+                    help="Path to config JSON (default: config.json)")
+    ap.add_argument("--init-config", action="store_true",
+                    help="Launch interactive wizard to create/update the config JSON")
+    return ap.parse_args()
+
+def has_rows(obj) -> bool:
+    return isinstance(obj, pd.DataFrame) and not obj.empty
+
+def export_if_rows(df: pd.DataFrame, path: str, *, index: bool = False) -> str:
+    if has_rows(df):
+        df.to_csv(path, index=index)
+        return path
+    return "(no rows)"
+
+def to_number(x):
+    if pd.isna(x): return np.nan
+    s = str(x).strip().replace("\u200b", "")
+    if s == "": return np.nan
+    if re.match(r"^\(.*\)$", s): s = "-" + s.strip("()")
+    s = s.replace("$","").replace(",","").strip()
+    try: return float(s)
+    except: return np.nan
+
+def parse_zone_suffix(zid):
+    if pd.isna(zid): return np.nan
+    s = str(zid)
+    if "-" in s:
+        s = s.split("-",1)[1].strip()
+    try: return str(int(float(s)))
+    except: return str(s)
+
+def robust_mode(series: pd.Series):
+    if series.empty: return np.nan
+    try:
+        m = series.mode()
+        return m.iloc[0] if len(m)>0 else series.iloc[0]
+    except Exception:
+        return series.iloc[0]
+
+def _num_zone(z):
+    try: return int(float(z))
+    except Exception: return None
+
+# ---------- Load ----------
+def load_data(path):
+    df = pd.read_csv(path, dtype=str, usecols=lambda c: True)
+    df.columns = df.columns.str.strip()
+
+    # Zone Suffix create/clean
+    if "Zone Suffix" not in df.columns and "Price Zone ID" in df.columns:
+        df["Zone Suffix"] = df["Price Zone ID"].apply(parse_zone_suffix)
+    elif "Zone Suffix" in df.columns:
+        df["Zone Suffix"] = df["Zone Suffix"].apply(parse_zone_suffix)
+    else:
+        df["Zone Suffix"] = np.nan
+
+    # Numerics
+    for col in ["Pounds CY","Pounds PY","Delta Pounds YoY","Computer Margin Ext $ CY","Computer Margin Ext $ PY"]:
+        if col in df.columns:
+            df[col] = df[col].apply(to_number)
+
+    # Delta pounds if missing
+    if "Delta Pounds YoY" not in df.columns:
+        df["Delta Pounds YoY"] = df["Pounds CY"].fillna(0) - df["Pounds PY"].fillna(0)
+    else:
+        mask = df["Delta Pounds YoY"].isna()
+        df.loc[mask,"Delta Pounds YoY"] = df.loc[mask,"Pounds CY"].fillna(0) - df["Pounds PY"].fillna(0)
+
+    # Keys / flags
+    df["Combo Key"] = df["NPD Cuisine Type"].astype(str) + "|" + df["Company Name"].astype(str)
+    df["Active_CY"] = (df["Pounds CY"].fillna(0) > 0)
+    df["Active_PY"] = (df["Pounds PY"].fillna(0) > 0)
+    return df
+
+# ---------- Current zone ----------
+def compute_current_zone(df: pd.DataFrame) -> pd.DataFrame:
+    cur_active = (df[df["Active_CY"] & df["Zone Suffix"].notna()]
+                    .groupby("Combo Key")["Zone Suffix"]
+                    .agg(lambda s: robust_mode(s))
+                    .rename("Current Zone Suffix"))
+    cur_all = (df[df["Zone Suffix"].notna()]
+                 .groupby("Combo Key")["Zone Suffix"]
+                 .agg(lambda s: robust_mode(s))
+                 .rename("Fallback Zone Suffix"))
+    cur = cur_all.to_frame().merge(cur_active.to_frame(), left_index=True, right_index=True, how="left").reset_index()
+    cur["Current Zone Suffix"] = cur["Current Zone Suffix"].fillna(cur["Fallback Zone Suffix"])
+    return cur[["Combo Key","Current Zone Suffix"]]
+
+# ---------- Customer totals & intra-year counts ----------
+def customer_totals_and_main_zones(df: pd.DataFrame):
+    base = df[df["Company Customer Number"].notna()].copy()
+
+    # counts of CY-positive "lines" per Combo×Customer from raw df
+    cy_pos_by_cc = (
+        base.assign(CY_pos_line = (base["Pounds CY"].fillna(0) > 0).astype(int))
+            .groupby(["Combo Key","Company Customer Number"], as_index=False)
+            .agg(CY_Positive_Lines=("CY_pos_line","sum"))
+    )
+
+    # aggregate per Combo×Customer×Zone (for main zone logic)
+    agg = (base.groupby(["Combo Key","Company Customer Number","Zone Suffix"], dropna=False, as_index=False)
+                .agg(CY=("Pounds CY","sum"), PY=("Pounds PY","sum")))
+
+    totals = (agg.groupby(["Combo Key","Company Customer Number"], as_index=False)
+                 .agg(CY_total=("CY","sum"), PY_total=("PY","sum")))
+
+    # main zones (by lbs)
+    cy_idx = agg.groupby(["Combo Key","Company Customer Number"])["CY"].idxmax()
+    py_idx = agg.groupby(["Combo Key","Company Customer Number"])["PY"].idxmax()
+    cy_main = agg.loc[cy_idx, ["Combo Key","Company Customer Number","Zone Suffix","CY"]] \
+                 .rename(columns={"Zone Suffix":"CY_Main_Zone","CY":"CY_Main_Lbs"})
+    py_main = agg.loc[py_idx, ["Combo Key","Company Customer Number","Zone Suffix","PY"]] \
+                 .rename(columns={"Zone Suffix":"PY_Main_Zone","PY":"PY_Main_Lbs"})
+
+    cust = (totals.merge(py_main, on=["Combo Key","Company Customer Number"], how="left")
+                  .merge(cy_main, on=["Combo Key","Company Customer Number"], how="left")
+                  .merge(cy_pos_by_cc, on=["Combo Key","Company Customer Number"], how="left"))
+
+    # clean empty mains
+    cust.loc[cust["PY_total"].fillna(0) <= 0, "PY_Main_Zone"] = np.nan
+    cust.loc[cust["CY_total"].fillna(0) <= 0, "CY_Main_Zone"] = np.nan
+
+    # movement/engagement flags
+    cust["Delta_Lbs"]  = cust["CY_total"].fillna(0) - cust["PY_total"].fillna(0)
+    cust["GrewFlag"]   = (cust["Delta_Lbs"] > 0).astype(int)
+    cust["ContractedFlag"] = (cust["Delta_Lbs"] < 0).astype(int)
+    cust["RepeatFlag_YoY"] = ((cust["CY_total"].fillna(0) > 0) & (cust["PY_total"].fillna(0) > 0)).astype(int)
+
+    # Intra-year stickiness: more than one CY-positive line in this file
+    cust["CY_Positive_Lines"] = cust["CY_Positive_Lines"].fillna(0).astype(int)
+    cust["RepeatFlag_IntraYear"] = (cust["CY_Positive_Lines"] > 1).astype(int)
+
+    # Strong stickiness: PY>0 AND >1 CY positive lines
+    cust["RepeatFlag_Strong"] = ((cust["RepeatFlag_IntraYear"] == 1) & (cust["PY_total"].fillna(0) > 0)).astype(int)
+
+    # lifecycle flags
+    cust["RepeatFlag"] = cust["RepeatFlag_YoY"]  # legacy alias
+    cust["RepeatFlag"] = cust["RepeatFlag"].astype(int)
+    cust["NewFlag"]    = ((cust["PY_total"].fillna(0) <= 0) & (cust["CY_total"].fillna(0) > 0)).astype(int)
+    cust["LostFlag"]   = ((cust["PY_total"].fillna(0) > 0) & (cust["CY_total"].fillna(0) <= 0)).astype(int)
+    return cust
+
+# ---------- Zone metrics (by CY main zone) ----------
+def zone_metrics_from_customers(cust: pd.DataFrame) -> pd.DataFrame:
+    c = cust.copy()
+    c["CYz"] = c["CY_Main_Zone"].astype(str)
+    cz = c[c["CY_Main_Zone"].notna()].copy()
+    if cz.empty:
+        return pd.DataFrame(columns=[
+            "Combo Key","Zone Suffix","Base_Customers","Active_Customers_CY",
+            "Growing_Customers","Bleeding_Customers","Repeat_Customers","New_Customers",
+            "GrowthShare","BleedRate","RepeatShare",
+            "Repeat_Customers_IntraYear","RepeatShare_IntraYear",
+            "Repeat_Customers_YoY","RepeatShare_YoY",
+            "Repeat_Customers_Strong","RepeatShare_Strong"
+        ])
+
+    grp = cz.groupby(["Combo Key","CYz"], as_index=False)
+    out = grp.agg(
+        Base_Customers = ("Company Customer Number","nunique"),  # CY active base in this zone
+        Active_Customers_CY = ("Company Customer Number","nunique"),
+        Growing_Customers = ("GrewFlag","sum"),
+        Bleeding_Customers = ("ContractedFlag","sum"),
+        Repeat_Customers_YoY = ("RepeatFlag_YoY","sum"),
+        Repeat_Customers_IntraYear = ("RepeatFlag_IntraYear","sum"),
+        Repeat_Customers_Strong = ("RepeatFlag_Strong","sum"),
+        New_Customers = ("NewFlag","sum"),
+    ).rename(columns={"CYz":"Zone Suffix"})
+
+    base = out["Base_Customers"].replace(0, np.nan)
+    out["GrowthShare"]  = (out["Growing_Customers"]  / base).round(6)
+    out["BleedRate"]    = (out["Bleeding_Customers"] / base).round(6)
+
+    # Shares
+    out["RepeatShare_YoY"]       = (out["Repeat_Customers_YoY"]       / base).round(6)
+    out["RepeatShare_IntraYear"] = (out["Repeat_Customers_IntraYear"] / base).round(6)
+    out["RepeatShare_Strong"]    = (out["Repeat_Customers_Strong"]    / base).round(6)
+
+    # Back-compat: keep RepeatShare = YoY
+    out["RepeatShare"] = out["RepeatShare_YoY"]
+
+    out = out.fillna(0)
+    return out
+
+# ---------- Picks & recommendations ----------
+def pick_zones(z_table: pd.DataFrame, current_map: pd.DataFrame,
+               tie_order=None, action_keep="Keep", action_change="Change") -> pd.DataFrame:
+    if z_table.empty:
+        cols = [
+            "Combo Key",
+            "Top_Growth_Zone","Top_Growth_GrowthShare","Top_Growth_BleedRate","Top_Growth_RepeatShare",
+            "Top_Growth_BaseCustomers","Top_Growth_ActiveCustomers_CY",
+            "Low_Bleed_Zone","Low_Bleed_BleedRate","Low_Bleed_GrowthShare","Low_Bleed_RepeatShare",
+            "Low_Bleed_BaseCustomers","Low_Bleed_ActiveCustomers_CY",
+            "Uncapped_WhatIf_Zone","WhatIf_GrowthShare","WhatIf_BleedRate","WhatIf_RepeatShare",
+            "WhatIf_BaseCustomers","WhatIf_ActiveCustomers_CY",
+            "Recommended Zone Suffix","Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare",
+            "Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+            "Evidence_Bucket","Rec_Note","Rec_Action","Evidence_Insufficient"
+        ]
+        return pd.DataFrame(columns=cols)
+
+    # default tie-break order if none provided
+    tie_order = tie_order or ["GrowthShare","RepeatShare_Strong","RepeatShare_IntraYear","Active_Customers_CY"]
+
+    z = z_table.copy()
+    z["Zone Suffix"] = z["Zone Suffix"].astype(str)
+
+    def repeat_pref(df):
+        return df.assign(
+            _TieRepeat1 = df.get("RepeatShare_Strong", pd.Series(0, index=df.index)),
+            _TieRepeat2 = df.get("RepeatShare_IntraYear", pd.Series(0, index=df.index)),
+            _TieRepeat3 = df.get("RepeatShare", pd.Series(0, index=df.index)),
+        )
+
+    # Top growth
+    z_top = repeat_pref(z)
+    topg_idx = (z_top.sort_values(
+                    ["Combo Key","GrowthShare","_TieRepeat1","_TieRepeat2","Active_Customers_CY"],
+                    ascending=[True, False, False, False, False]
+                ).groupby("Combo Key").head(1).index)
+
+    top_g = (z_top.loc[topg_idx, [
+                "Combo Key","Zone Suffix","GrowthShare","BleedRate","RepeatShare",
+                "Base_Customers","Active_Customers_CY"
+            ]]
+            .rename(columns={
+                "Zone Suffix":"Top_Growth_Zone",
+                "GrowthShare":"Top_Growth_GrowthShare",
+                "BleedRate":"Top_Growth_BleedRate",
+                "RepeatShare":"Top_Growth_RepeatShare",   # legacy YoY
+                "Base_Customers":"Top_Growth_BaseCustomers",
+                "Active_Customers_CY":"Top_Growth_ActiveCustomers_CY"
+            }))
+
+    # Low bleed
+    z_low = repeat_pref(z)
+    lowb_idx = (z_low.sort_values(
+                    ["Combo Key","BleedRate","_TieRepeat1","_TieRepeat2","Active_Customers_CY"],
+                    ascending=[True, True, False, False, False]
+                ).groupby("Combo Key").head(1).index)
+
+    low_b = (z_low.loc[lowb_idx, [
+                "Combo Key","Zone Suffix","BleedRate","GrowthShare","RepeatShare",
+                "Base_Customers","Active_Customers_CY"
+            ]]
+            .rename(columns={
+                "Zone Suffix":"Low_Bleed_Zone",
+                "BleedRate":"Low_Bleed_BleedRate",
+                "GrowthShare":"Low_Bleed_GrowthShare",
+                "RepeatShare":"Low_Bleed_RepeatShare",     # legacy YoY
+                "Base_Customers":"Low_Bleed_BaseCustomers",
+                "Active_Customers_CY":"Low_Bleed_ActiveCustomers_CY"
+            }))
+
+    # Uncapped what-if (use top growth)
+    what_if = (z_top.loc[topg_idx, [
+                "Combo Key","Zone Suffix","GrowthShare","BleedRate","RepeatShare",
+                "Base_Customers","Active_Customers_CY"
+            ]]
+            .rename(columns={
+                "Zone Suffix":"Uncapped_WhatIf_Zone",
+                "GrowthShare":"WhatIf_GrowthShare",
+                "BleedRate":"WhatIf_BleedRate",
+                "RepeatShare":"WhatIf_RepeatShare",        # legacy YoY
+                "Base_Customers":"WhatIf_BaseCustomers",
+                "Active_Customers_CY":"WhatIf_ActiveCustomers_CY"
+            }))
+
+    rec = (top_g.merge(low_b, on="Combo Key", how="outer")
+               .merge(what_if, on="Combo Key", how="left")
+               .merge(current_map, on="Combo Key", how="left"))
+
+    # Price-capped recommendation (≤ current, exclude 0)
+    z_by_combo = {k: g.copy() for k, g in z.groupby("Combo Key")}
+
+    def choose_rec(row):
+        combo = row["Combo Key"]
+        table = z_by_combo.get(combo)
+        if table is None or table.empty:
+            return pd.Series([np.nan,np.nan,np.nan,np.nan,0,0,"Investigate",
+                              "No zone data","Investigate",1],
+                             index=["Recommended Zone Suffix","Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare",
+                                    "Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+                                    "Evidence_Bucket","Rec_Note","Rec_Action","Evidence_Insufficient"])
+
+        cur = row.get("Current Zone Suffix")
+        if pd.isna(cur):
+            top = table.sort_values(
+                    ["GrowthShare","RepeatShare_Strong","RepeatShare_IntraYear","Active_Customers_CY"],
+                    ascending=[False, False, False, False]
+                  ).iloc[0]
+            note = f"No current zone; What-If suggests {top['Zone Suffix']}."
+            return pd.Series([str(top["Zone Suffix"]), float(top["GrowthShare"]), float(top["BleedRate"]),
+                              float(top.get("RepeatShare", 0.0)),
+                              int(top.get("Base_Customers",0)), int(top.get("Active_Customers_CY",0)),
+                              "Investigate", note, "Investigate", 1],
+                             index=["Recommended Zone Suffix","Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare",
+                                    "Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+                                    "Evidence_Bucket","Rec_Note","Rec_Action","Evidence_Insufficient"])
+
+        try:
+            cur_i = int(float(cur))
+        except Exception:
+            return pd.Series([np.nan,np.nan,np.nan,np.nan,0,0,"Investigate",
+                              "Current zone parse failed; review What-If","Investigate",1],
+                             index=["Recommended Zone Suffix","Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare",
+                                    "Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+                                    "Evidence_Bucket","Rec_Note","Rec_Action","Evidence_Insufficient"])
+
+        cand = table.assign(zone_i=pd.to_numeric(table["Zone Suffix"], errors="coerce"))
+        if NEVER_UPZONE:
+            cand = cand[cand["zone_i"].notna() & (cand["zone_i"] <= cur_i)]
+        else:
+            cand = cand[cand["zone_i"].notna()]
+        if EXCLUDE_ZONE_ZERO:
+            cand = cand[cand["Zone Suffix"] != "0"]
+        if cand.empty:
+            return pd.Series([np.nan,np.nan,np.nan,np.nan,0,0,"Investigate",
+                              "No candidate ≤ current; see What-If","Investigate",1],
+                             index=["Recommended Zone Suffix","Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare",
+                                    "Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+                                    "Evidence_Bucket","Rec_Note","Rec_Action","Evidence_Insufficient"])
+
+        # sort by GrowthShare → RepeatStrong → RepeatIntra → Active
+        # ensure all tie columns exist
+        for col in tie_order:
+            if col not in cand.columns:
+                cand[col] = 0.0
+
+        # sort by the provided order
+        cand = cand.sort_values(tie_order, ascending=[False]*len(tie_order))
+
+        pick = cand.iloc[0]
+        act_c = int(pick.get("Active_Customers_CY", 0))
+
+        # evidence
+        if act_c >= EVID_SWITCH_MIN: evidence_bucket = "Switch"
+        elif act_c >= EVID_PILOT_MIN: evidence_bucket = "Pilot"
+        else: evidence_bucket = "Investigate"
+
+        rec_zone_str = str(pick["Zone Suffix"])
+        rec_zone_i   = int(pick["zone_i"]) if pd.notna(pick.get("zone_i")) else None
+        same_zone    = (rec_zone_i == cur_i)
+        action_label = action_keep if same_zone else action_change
+        note = "Current zone already best ≤ constraints." if same_zone else ""
+
+        return pd.Series([
+            rec_zone_str,
+            float(pick["GrowthShare"]), float(pick["BleedRate"]), float(pick.get("RepeatShare", 0.0)),
+            int(pick.get("Base_Customers", 0)), act_c,
+            evidence_bucket, note, action_label, int(evidence_bucket == "Investigate")
+        ], index=[
+            "Recommended Zone Suffix","Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare",
+            "Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+            "Evidence_Bucket","Rec_Note","Rec_Action","Evidence_Insufficient"
+        ])
+
+    rec = pd.concat([rec, rec.apply(choose_rec, axis=1)], axis=1)
+    rec["Evidence_Insufficient"] = rec["Evidence_Insufficient"].astype(int)
+    return rec
+
+# ---------- Combo priority ----------
+def combo_priority_inputs(df: pd.DataFrame, cust: pd.DataFrame) -> pd.DataFrame:
+    vol = (df.groupby("Combo Key", as_index=False)
+             .agg(Total_Pounds_CY=("Pounds CY","sum"),
+                  Total_Delta_Pounds_YoY=("Delta Pounds YoY","sum")))
+    vol["LossMag"] = vol["Total_Delta_Pounds_YoY"].apply(lambda x: max(0.0, -float(x if pd.notna(x) else 0.0)))
+
+    cc = (cust.groupby("Combo Key", as_index=False)
+              .agg(
+                  Base_Customers_Combo=("Company Customer Number","nunique"),
+                  Active_Customers_CY_Combo=("CY_total", lambda s: (s.fillna(0)>0).sum()),
+                  Repeat_Customers_Combo=("RepeatFlag_YoY","sum"),
+                  New_Customers_Combo=("NewFlag","sum"),
+                  Lost_Customers_Combo=("LostFlag","sum"),
+              ))
+
+    cust["AtRiskFlag"] = (cust["CY_total"].fillna(0) < cust["PY_total"].fillna(0)).astype(int)
+    ar = (cust.groupby("Combo Key", as_index=False)
+              .agg(AtRisk_Customers_Combo=("AtRiskFlag","sum")))
+
+    out = (vol.merge(cc, on="Combo Key", how="left")
+              .merge(ar, on="Combo Key", how="left"))
+    base = out["Base_Customers_Combo"].replace(0, np.nan)
+    out["AtRisk_Share_Combo"] = (out["AtRisk_Customers_Combo"] / base).round(4)
+    out["BleedComp"] = out["AtRisk_Share_Combo"].fillna(0.0)
+
+    for c in ["Base_Customers_Combo","Active_Customers_CY_Combo",
+              "Repeat_Customers_Combo","New_Customers_Combo","Lost_Customers_Combo",
+              "AtRisk_Customers_Combo","AtRisk_Share_Combo","LossMag","BleedComp"]:
+        if c in out.columns: out[c] = out[c].fillna(0)
+
+    return out
+
+def PRio_WEIGHTS_SAFE(key):
+    return PRIO_WEIGHTS.get(key, 0.0)
+
+def add_priority(scored: pd.DataFrame) -> pd.DataFrame:
+    def pct(s): 
+        return s.rank(pct=True).fillna(0.0)
+
+    scored["LossMag_pct"] = pct(scored["LossMag"])
+    scored["Size_pct"]    = pct(scored["Total_Pounds_CY"])
+    scored["Active_pct"]  = pct(scored["Active_Customers_CY_Combo"])
+    scored["Bleed_pct"]   = scored["BleedComp"].clip(0,1)
+
+    scored["RescuePriorityScore"] = (
+        PRio_WEIGHTS_SAFE("BleedComp") * scored["Bleed_pct"] +
+        PRio_WEIGHTS_SAFE("LossMag")   * scored["LossMag_pct"] +
+        PRio_WEIGHTS_SAFE("Active")    * scored["Active_pct"] +
+        PRio_WEIGHTS_SAFE("Size")      * scored["Size_pct"]
+    )
+    scored["Rescue Priority Rank"] = scored["RescuePriorityScore"] \
+                                        .rank(ascending=False, method="dense").astype(int)
+
+    scored["Loss_Attack_Flag"] = (
+        (scored["LossMag_pct"] >= LOSS_ATTACK_PCT) | (scored["LossMag"] >= LOSS_ATTACK_MIN_LBS)
+    ).astype(int)
+
+    return scored
+
+# ---------- Coverage flags ----------
+def coverage_flags(df_raw: pd.DataFrame) -> pd.DataFrame:
+    ZONE_SET = ["0","1","2","3","4","5"]
+    tmp = (df_raw[df_raw["Zone Suffix"].notna()]
+              .groupby("Combo Key")["Zone Suffix"]
+              .agg(lambda s: sorted({str(x) for x in s if pd.notna(x)}))
+              .reset_index()
+              .rename(columns={"Zone Suffix":"_obs"}))
+    if tmp.empty:
+        return pd.DataFrame(columns=[
+            "Combo Key","Observed_Zones_List","Observed_Zones_Count","Missing_Zones_List",
+            "Coverage_Fraction","Has_Unused_Zones"
+        ])
+    tmp["Observed_Zones_List"]  = tmp["_obs"].apply(lambda lst: ",".join(lst))
+    tmp["Observed_Zones_Count"] = tmp["_obs"].apply(len)
+    tmp["Missing_Zones_List"]   = tmp["_obs"].apply(lambda lst: ",".join([z for z in ZONE_SET if z not in lst]))
+    tmp["Has_Unused_Zones"]     = (tmp["Missing_Zones_List"].str.len() > 0).astype(int)
+    tmp["Coverage_Fraction"]    = tmp["Observed_Zones_Count"] / float(len(ZONE_SET))
+    return tmp.drop(columns=["_obs"])
+
+# ---------- Customer transitions ----------
+def compute_customer_zone_transitions(df: pd.DataFrame):
+    cust = customer_totals_and_main_zones(df)
+    if cust.empty:
+        empty_det = pd.DataFrame(columns=[
+            "Combo Key","Company Customer Number","PY_Main_Zone","CY_Main_Zone","Move_Direction",
+            "CY_total","PY_total","Delta_Lbs","GrewFlag","ContractedFlag","RepeatFlag","NewFlag","LostFlag"
+        ])
+        empty_sum = pd.DataFrame(columns=[
+            "Combo Key","Movers_Count","Moved_Up_Count","Moved_Down_Count",
+            "Moved_Up_Grew_Count","Moved_Up_Contracted_Count",
+            "Moved_Down_Grew_Count","Moved_Down_Contracted_Count"
+        ])
+        return empty_det, empty_sum
+
+    det = cust.copy()
+    det["py_i"] = det["PY_Main_Zone"].apply(_num_zone)
+    det["cy_i"] = det["CY_Main_Zone"].apply(_num_zone)
+
+    def _direction(row):
+        p, c = row["py_i"], row["cy_i"]
+        if p is None or c is None: return "Unknown"
+        if p == c: return "Same"
+        return "Up" if c > p else "Down"
+
+    det["Move_Direction"] = det.apply(_direction, axis=1)
+
+    det["is_mover"]      = det["Move_Direction"].isin(["Up","Down"]).astype(int)
+    det["is_up"]         = det["Move_Direction"].eq("Up").astype(int)
+    det["is_down"]       = det["Move_Direction"].eq("Down").astype(int)
+    det["up_grew"]       = (det["Move_Direction"].eq("Up")   & det["GrewFlag"].eq(1)).astype(int)
+    det["up_contract"]   = (det["Move_Direction"].eq("Up")   & det["ContractedFlag"].eq(1)).astype(int)
+    det["down_grew"]     = (det["Move_Direction"].eq("Down") & det["GrewFlag"].eq(1)).astype(int)
+    det["down_contract"] = (det["Move_Direction"].eq("Down") & det["ContractedFlag"].eq(1)).astype(int)
+
+    summ = (det.groupby("Combo Key")[["is_mover","is_up","is_down","up_grew","up_contract","down_grew","down_contract"]]
+              .sum().reset_index()
+              .rename(columns={
+                  "is_mover":"Movers_Count","is_up":"Moved_Up_Count","is_down":"Moved_Down_Count",
+                  "up_grew":"Moved_Up_Grew_Count","up_contract":"Moved_Up_Contracted_Count",
+                  "down_grew":"Moved_Down_Grew_Count","down_contract":"Moved_Down_Contracted_Count"
+              }))
+    return det, summ
+
+# ---------- Zone movement rollup ----------
+def zone_movement_summary_from_transitions(trans_detail: pd.DataFrame) -> pd.DataFrame:
+    if trans_detail is None or trans_detail.empty:
+        return pd.DataFrame(columns=[
+            "Combo Key","Zone","CY_Base_Main","PY_Base_Main",
+            "Adds","Exits","Net_Adds","Stays",
+            "Adds_New","Adds_From_Higher","Adds_From_Lower",
+            "Exits_To_Higher","Exits_To_Lower",
+            "Adds_Grew","Exits_Contracted",
+            "Adds_Share_of_CYBase","Exits_Share_of_PYBase"
+        ])
+    td = trans_detail.copy()
+    td["PYz"] = td["PY_Main_Zone"].astype(str)
+    td["CYz"] = td["CY_Main_Zone"].astype(str)
+    td["py_i"] = td["PY_Main_Zone"].apply(_num_zone)
+    td["cy_i"] = td["CY_Main_Zone"].apply(_num_zone)
+
+    rows = []
+    for combo, g in td.groupby("Combo Key"):
+        zones = sorted({z for z in pd.concat([g["PYz"], g["CYz"]]).dropna().unique()})
+        for z in zones:
+            zi = _num_zone(z)
+            cy_base = int((g["CYz"] == z).sum())
+            py_base = int((g["PYz"] == z).sum())
+
+            adds_mask  = (g["CYz"] == z) & (g["PYz"] != z)
+            exits_mask = (g["PYz"] == z) & (g["CYz"] != z)
+            stays_mask = (g["PYz"] == z) & (g["CYz"] == z)
+
+            adds  = int(adds_mask.sum())
+            exits = int(exits_mask.sum())
+            stays = int(stays_mask.sum())
+
+            adds_new         = int(((adds_mask) & (g["PY_total"].fillna(0) <= 0)).sum())
+            adds_from_higher = int(((adds_mask) & (g["py_i"] > zi)).sum())
+            adds_from_lower  = int(((adds_mask) & (g["py_i"] < zi)).sum())
+            exits_to_higher  = int(((exits_mask) & (g["cy_i"] > zi)).sum())
+            exits_to_lower   = int(((exits_mask) & (g["cy_i"] < zi)).sum())
+            adds_grew        = int(((adds_mask) & (g["GrewFlag"].eq(1))).sum())
+            exits_contract   = int(((exits_mask) & (g["ContractedFlag"].eq(1))).sum())
+
+            adds_share  = (adds / cy_base) if cy_base > 0 else np.nan
+            exits_share = (exits / py_base) if py_base > 0 else np.nan
+
+            rows.append({
+                "Combo Key": combo, "Zone": str(z),
+                "CY_Base_Main": cy_base, "PY_Base_Main": py_base,
+                "Adds": adds, "Exits": exits, "Net_Adds": adds - exits, "Stays": stays,
+                "Adds_New": adds_new,
+                "Adds_From_Higher": adds_from_higher, "Adds_From_Lower": adds_from_lower,
+                "Exits_To_Higher": exits_to_higher, "Exits_To_Lower": exits_to_lower,
+                "Adds_Grew": adds_grew, "Exits_Contracted": exits_contract,
+                "Adds_Share_of_CYBase": round(adds_share, 4),
+                "Exits_Share_of_PYBase": round(exits_share, 4),
+            })
+    return pd.DataFrame(rows)
+
+# ---------- Attach current & recommended movement ----------
+def attach_current_and_rec_zone_movement(outdf: pd.DataFrame, zmove: pd.DataFrame,
+                                         current_map: pd.DataFrame, picks: pd.DataFrame) -> pd.DataFrame:
+    # --- Debug: confirm each bucket has rows before we build the PDF ---
+    tmp = outdf.copy()
+    for col in ["Rec_Action","Evidence_Bucket"]:
+        if col in tmp.columns:
+            tmp[col] = tmp[col].fillna("").astype(str).str.strip()
+
+    # Use the actual action labels from config (already loaded above)
+    action_change = ACTION_CHANGE if 'ACTION_CHANGE' in globals() else "Change"
+    action_keep   = ACTION_KEEP   if 'ACTION_KEEP'   in globals() else "Keep"
+
+    print(
+        "DEBUG COUNTS:",
+        "Change/Switch =", ((tmp["Rec_Action"]==action_change) & (tmp["Evidence_Bucket"]=="Switch")).sum(),
+        "Change/Pilot  =", ((tmp["Rec_Action"]==action_change) & (tmp["Evidence_Bucket"]=="Pilot")).sum(),
+        "Change/Invest =", ((tmp["Rec_Action"]==action_change) & (tmp["Evidence_Bucket"]=="Investigate")).sum(),
+        "Keep/Hot      =", ((tmp["Rec_Action"]==action_keep)   & (tmp["Evidence_Bucket"].isin(["Switch","Pilot"]))).sum(),
+        "InvestigateLoss =", ((tmp["Evidence_Bucket"]=="Investigate") & (tmp.get("Loss_Attack_Flag",0)==1)).sum(),
+    )
+
+    if zmove is None or zmove.empty:
+        for prefix in ["CurZone","RecZone"]:
+            for c in ["Adds","Exits","Net_Adds","Stays","Adds_New",
+                      "Adds_From_Higher","Adds_From_Lower",
+                      "Exits_To_Higher","Exits_To_Lower",
+                      "Adds_Grew","Exits_Contracted",
+                      "Adds_Share_of_CYBase","Exits_Share_of_PYBase",
+                      "CY_Base_Main","PY_Base_Main"]:
+                outdf[f"{prefix}_{c}"] = np.nan
+        return outdf
+
+    zmove = zmove.copy()
+    zmove["Zone"] = zmove["Zone"].astype(str)
+
+    # Current
+    cur = current_map.rename(columns={"Current Zone Suffix":"Zone"})
+    cur = cur.merge(zmove, on=["Combo Key","Zone"], how="left").drop(columns=["Zone"])
+    cur = cur.add_prefix("CurZone_")
+    outdf = outdf.merge(cur, left_on="Combo Key", right_on="CurZone_Combo Key", how="left") \
+                 .drop(columns=["CurZone_Combo Key"])
+
+    # Recommended
+    if "Recommended Zone Suffix" in picks.columns:
+        rec = picks[["Combo Key","Recommended Zone Suffix"]].rename(columns={"Recommended Zone Suffix":"Zone"})
+        rec = rec.merge(zmove, on=["Combo Key","Zone"], how="left").drop(columns=["Zone"])
+        rec = rec.add_prefix("RecZone_")
+        outdf = outdf.merge(rec, left_on="Combo Key", right_on="RecZone_Combo Key", how="left") \
+                     .drop(columns=["RecZone_Combo Key"])
+    return outdf
+
+# ---------- Attack plan string ----------
+def build_attack_plan(df: pd.DataFrame, *, action_change="Change", action_keep="Keep") -> pd.Series:
+    def plan_row(r):
+        loss = int(r.get("Loss_Attack_Flag", 0)) == 1
+        evid = str(r.get("Evidence_Bucket", "") or "")
+        act  = str(r.get("Rec_Action", "") or "")
+        recz = str(r.get("Recommended Zone Suffix", "") or "")
+        what = str(r.get("Uncapped_WhatIf_Zone", "") or "—")
+
+        if act == action_change:
+            if evid == "Switch": base = f"Switch to Zone {recz}"
+            elif evid == "Pilot": base = f"Pilot switch to Zone {recz}"
+            else: base = f"Investigate switch to Zone {recz}"
+        elif act == action_keep:
+            if evid in ("Switch","Pilot"):
+                base = f"Keep (current already best ≤ constraints); monitor. Evidence={evid} for Zone {recz}"
+            else:
+                base = f"Investigate (no strong alternative ≤ constraints). What-If top zone={what}"
+        else:
+            base = "Investigate"
+
+        if   loss and evid == "Investigate": return base + " — PRIORITY: Loss attack (evidence thin)."
+        elif loss and evid == "Pilot":       return base + " — PRIORITY: Loss attack (pilot)."
+        elif loss and evid == "Switch":      return base + " — PRIORITY: Loss attack."
+        return base
+
+    return df.apply(plan_row, axis=1)
+
+def _ask(prompt, default=None, cast=str, allow_blank=False, choices=None):
+    tip = f" [{default}]" if default is not None else ""
+    while True:
+        val = input(f"{prompt}{tip}: ").strip()
+        if not val:
+            if default is not None:
+                return default
+            if allow_blank:
+                return None
+        if choices and val not in choices:
+            print(f"Please choose one of: {', '.join(choices)}")
+            continue
+        try:
+            return cast(val)
+        except Exception:
+            print(f"Enter a valid {cast.__name__} value.")
+
+def _ask_bool(prompt, default=True):
+    d = "y" if default else "n"
+    while True:
+        val = input(f"{prompt} [y/n] (default {d}): ").strip().lower()
+        if val == "": return default
+        if val in ["y","yes"]: return True
+        if val in ["n","no"]:  return False
+        print("Type y or n.")
+
+def _ask_scale(prompt, default=3, lo=1, hi=5):
+    val = _ask(f"{prompt} ({lo}-{hi})", default=default, cast=int)
+    return max(lo, min(hi, val))
+
+def _ask_choice(prompt, choices, default):
+    return _ask(f"{prompt} {choices}", default=default, choices=choices)
+
+def _order_tiebreakers(default_order):
+    print("\nTie-breakers (rank after GrowthShare). Enter order by number, comma-separated.")
+    options = [
+        ("RepeatShare_Strong", "PY>0 AND >1 CY positive lines"),
+        ("RepeatShare_IntraYear", ">1 CY positive lines (includes NEW)"),
+        ("Active_Customers_CY", "bigger active base"),
+    ]
+    for i,(k,desc) in enumerate(options, start=1):
+        print(f"  {i}) {k:>22} — {desc}")
+    default_str = "1,2,3"
+    raw = input(f"Your order [default {default_str}]: ").strip() or default_str
+    try:
+        idxs = [int(x) for x in raw.split(",")]
+        picked = [options[i-1][0] for i in idxs if 1 <= i <= len(options)]
+        # Always start with GrowthShare
+        return ["GrowthShare"] + [x for x in picked if x in [o[0] for o in options]]
+    except Exception:
+        print("Using default order.")
+        return default_order
+
+def run_config_wizard(path="config.json"):
+    print("\n=== KSM Config Wizard ===\n")
+
+    owner = _ask("Your name", default="Your Name")
+    purpose = _ask("Purpose", default="Stabilize bleed and grow high-potential combos fast")
+
+    print("\nPriority sliders (1=low, 5=high). I’ll map them to weights.")
+    s_bleed = _ask_scale("Importance of reducing bleed (at-risk share)", default=5)
+    s_loss  = _ask_scale("Importance of recovering lost pounds (YoY loss)", default=4)
+    s_active= _ask_scale("Importance of active customer base size", default=3)
+    s_size  = _ask_scale("Importance of CY pounds (size)", default=2)
+
+    # Map 1..5 to weights roughly in [0.1..1.25], keeping your vibe
+    def map_weight(s): return round(0.1 + (s-1)*(1.15/4), 2)
+
+    w_bleed = map_weight(s_bleed)
+    w_loss  = map_weight(s_loss)
+    w_active= map_weight(s_active)
+    w_size  = map_weight(s_size)
+
+    optimize_for = _ask_choice("\nOptimize for",
+        choices=["balanced","margin","pounds","growth"], default="balanced")
+
+    print("\nEvidence thresholds (active customers in the recommended zone)")
+    switch_min = _ask("Switch threshold (>=)", default=20, cast=int)
+    pilot_min  = _ask("Pilot threshold (>=)", default=5, cast=int)
+
+    print("\nGuardrails")
+    never_up   = _ask_bool("Never up-zone?", True)
+    excl_zero  = _ask_bool("Exclude zone 0 from recs?", True)
+
+    print("\nLoss Attack")
+    top_pct    = _ask("Top loss percentile (0.0..1.0)", default=0.80, cast=float)
+    min_abs    = _ask("Min absolute YoY loss (lbs)", default=2000, cast=float)
+
+    print("\nAction labels (separate from evidence)")
+    action_change = _ask("Label for 'we change the zone'", default="Change")
+    action_keep   = _ask("Label for 'we keep current'", default="Keep")
+
+    print("\nPDF output")
+    make_pdf   = _ask_bool("Generate Next Steps PDF?", True)
+    top_k      = _ask("How many top actions to list", default=15, cast=int)
+    f_region   = _ask("Filter to Region (blank = all)", default=None, allow_blank=True)
+    f_company  = _ask("Filter to Company (blank = all)", default=None, allow_blank=True)
+
+    tie_order = _order_tiebreakers(["GrowthShare","RepeatShare_Strong","RepeatShare_IntraYear","Active_Customers_CY"])
+
+    # Optional data filters (only applied if the columns exist)
+    print("\nData filters")
+    only_cpa   = _ask_bool("Limit to Price Source Type = CPA (if column exists)?", True)
+    drop_exc   = _ask_bool("Drop rows with Exception/Discount flags (if columns exist)?", False)
+
+    cfg = {
+      "profile": {
+        "owner_name": owner,
+        "purpose": purpose
+      },
+      "priorities": {
+        "weight_bleed": w_bleed,
+        "weight_loss_mag": w_loss,
+        "weight_active": w_active,
+        "weight_size": w_size,
+        "optimize_for": optimize_for
+      },
+      "price_rules": {
+        "never_upzone": bool(never_up),
+        "exclude_zone_zero": bool(excl_zero)
+      },
+      "evidence": {
+        "switch_min_active": int(switch_min),
+        "pilot_min_active": int(pilot_min)
+      },
+      "loss_attack": {
+        "top_loss_percentile": float(top_pct),
+        "min_abs_loss_lbs": float(min_abs)
+      },
+      "tie_breakers": {
+        "order": tie_order
+      },
+      "actions": {
+        "action_labels": { "change": action_change, "keep": action_keep },
+        "separate_action_from_evidence": True
+      },
+      "pdf": {
+        "make_next_steps_pdf": bool(make_pdf),
+        "top_k_actions": int(top_k),
+        "filter_region": f_region,
+        "filter_company": f_company
+      },
+      "filters": {
+        "drop_discount_exceptions": bool(drop_exc),
+        "limit_cpa_price_source": bool(only_cpa)
+      }
+    }
+
+    print("\nPreview:\n" + json.dumps(cfg, indent=2))
+    if _ask_bool("\nWrite this to file?", True):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"\n✅ Saved {path}")
+    else:
+        print("\nCanceled. Nothing written.")
+        sys.exit(1)
+        
+def open_file(path):
+    try:
+        if sys.platform.startswith("darwin"):      # macOS
+            subprocess.call(["open", path])
+        elif os.name == "nt":                      # Windows
+            os.startfile(path)
+        elif os.name == "posix":                   # Linux
+            subprocess.call(["xdg-open", path])
+    except Exception as e:
+        print(f"⚠️ Could not auto-open PDF: {e}")
+
+def _subset_for_filter(df, region=None, company=None):
+    g = df.copy()
+    if region and "Company Region Name" in g.columns:
+        g = g[g["Company Region Name"].astype(str).str.strip().eq(str(region).strip())]
+    if company and "Company Name" in g.columns:
+        g = g[g["Company Name"].astype(str).str.strip().eq(str(company).strip())]
+    return g
+
+def _rank_block(df, title, k=15):
+    """Return a small dataframe for the PDF and a title."""
+    if df.empty:
+        return pd.DataFrame(columns=PDF_DISPLAY_COLS), title + " (no rows)"
+
+    sort_df = df.sort_values(["LossMag", "Rescue Priority Rank"],
+                             ascending=[False, True]).head(k)
+
+    have_cols = [c for c in PDF_DISPLAY_COLS if c in sort_df.columns]
+    return sort_df[have_cols], title
+
+def _format_percent(x, places=1):
+    if pd.isna(x): return ""
+    return f"{float(x)*100:.{places}f}%"
+
+def _format_number(x):
+    if pd.isna(x): return ""
+    return f"{float(x):,.0f}"
+
+def _reactive_label(v):
+    try:
+        return "Reactive – price cut failed" if int(v) == 1 else "Stable"
+    except Exception:
+        return "Stable"
+
+def _prettify_block(df: pd.DataFrame) -> pd.DataFrame:
+    """Select, rename and format columns for PDF tables."""
+    cols_pref = [
+        "Rescue Priority Rank","Combo Key",
+        "Current Zone Suffix","Recommended Zone Suffix",
+        "Rec_Action","Evidence_Bucket",
+        "LossMag","Rec_GrowthShare","Rec_RepeatShare","Rec_BleedRate",
+        "Movers_Share_of_Base","Reactive_Downshift_Likely"
+    ]
+    have = [c for c in cols_pref if c in df.columns]
+    d = df[have].copy()
+
+    # Renames
+    ren = {
+        "Rescue Priority Rank":"Rank",
+        "Combo Key":"Combo",
+        "Current Zone Suffix":"Cur",
+        "Recommended Zone Suffix":"Rec",
+        "Rec_Action":"Action",
+        "Evidence_Bucket":"Evidence",
+        "LossMag":"Loss (lbs)",
+        "Rec_GrowthShare":"Rec Growth",
+        "Rec_RepeatShare":"Rec Repeat",
+        "Rec_BleedRate":"Rec Bleed",
+        "Movers_Share_of_Base":"Movers %",
+        "Reactive_Downshift_Likely":"Reactive?"
+    }
+    d = d.rename(columns=ren)
+
+    # Trim long text
+    if "Combo" in d.columns:
+        d["Combo"] = d["Combo"].apply(lambda s: shorten(str(s), width=28, placeholder="…"))
+
+    # Format numerics / percents
+    if "Loss (lbs)" in d.columns:  d["Loss (lbs)"] = d["Loss (lbs)"].apply(_format_number)
+    for pc in ["Rec Growth","Rec Repeat","Rec Bleed","Movers %"]:
+        if pc in d.columns:
+            d[pc] = d[pc].apply(lambda v: _format_percent(v, 1))
+    if "Reactive?" in d.columns:
+        d["Reactive?"] = d["Reactive?"].apply(_reactive_label)
+
+    # Ensure simple dtypes for table writer
+    for c in d.columns:
+        d[c] = d[c].astype(str)
+
+    return d
+
+def _render_table_page(pdf, df, title, note=None, max_rows=25):
+    fig, ax = plt.subplots(figsize=(11, 8.5))  # landscape
+    ax.axis("off")
+    ax.set_title(title, loc="left", fontsize=14, pad=10)
+
+    start = 0
+    while start < len(df):
+        chunk = df.iloc[start:start+max_rows]
+        table = ax.table(
+            cellText=chunk.values,
+            colLabels=chunk.columns,
+            cellLoc='center',
+            loc='upper left'
+        )
+        for key, cell in table.get_celld().items():
+            if key[1] == 0:  # first column ("Rank")
+                cell.set_width(0.05)   # very narrow
+            if key[1] == 1:  # second column ("Combo")
+                cell.set_width(0.35)  # wider for long text
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.scale(1.2, 1.2)
+
+        # put note at bottom AFTER table is drawn
+        if note and start == 0:  
+            ax.text(
+                0.01, -0.08, note,  # negative y puts it below the table
+                transform=ax.transAxes,
+                fontsize=9,
+                va="top"
+            )
+
+        pdf.savefig(fig, bbox_inches="tight")
+        fig.clf(); ax = fig.add_subplot(111); ax.axis("off")
+        start += max_rows
+    plt.close(fig)
+    
+def _render_instruction_page(pdf, title, steps, why=None):
+    """A separate page with 'What to do' steps so we never overlay the table."""
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    ax.axis("off")
+    ax.set_title(title, loc="left", fontsize=16, pad=10)
+
+    y = 0.85
+    ax.text(0.03, y, "What to do:", fontsize=12, weight="bold", transform=ax.transAxes)
+    y -= 0.06
+    for i, s in enumerate(steps, start=1):
+        ax.text(0.05, y, f"{i}. {s}", fontsize=11, transform=ax.transAxes)
+        y -= 0.05
+    if why:
+        y -= 0.02
+        ax.text(0.03, y, "Why this works:", fontsize=12, weight="bold", transform=ax.transAxes)
+        y -= 0.05
+        for line in (why if isinstance(why, list) else [why]):
+            ax.text(0.05, y, f"• {line}", fontsize=11, transform=ax.transAxes)
+            y -= 0.045
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+def _playbook_for_section(section_key, goal="balanced"):
+    """
+    Returns (title, steps, why) for each section.
+    section_key in {"quick_wins","pilot","change_thin","keep","investigate_loss"}
+    goal in {"balanced","pounds","margin","growth"}
+    """
+    why_common = {
+        "balanced": ["Balances quick wins with risk control and customer stickiness."],
+        "pounds":   ["Targets biggest pound recovery first, then stability."],
+        "margin":   ["Keeps price safety while prioritizing lower bleed and repeat."],
+        "growth":   ["Focuses on zones where more customers grow and return."]
+    }
+    if section_key == "quick_wins":
+        title = "QUICK WINS — Change now (Switch evidence)"
+        steps = [
+            "Change the zone on these combos to the Recommended Zone.",
+            "Notify reps: why this zone wins (higher growth share, good repeat, acceptable bleed).",
+            "Set go-live and owner; track adds, exits, and net adds weekly."
+        ]
+        why   = ["Large active base in that zone = strong evidence to act now.", *why_common.get(goal, [])]
+    elif section_key == "pilot":
+        title = "PILOT NOW — Change with a pilot (Pilot evidence)"
+        steps = [
+            "Pilot the Recommended Zone for 4–6 weeks with a matched control (stay in current zone).",
+            "Pass gates: Rec Growth ↑, Rec Repeat ↑, Rec Bleed ↓, Net Adds > 0.",
+            "If pass: scale to Change; if not: adjust offer or hold."
+        ]
+        why   = ["Evidence is solid but smaller; a short pilot de-risks the change.", *why_common.get(goal, [])]
+    elif section_key == "change_thin":
+        title = "CHANGE — Investigate evidence (thin, but directionally strong)"
+        steps = [
+            "Small-scale change to the Recommended Zone on selected customers.",
+            "Pair with non-price plays: assortment add, cadence touch, perks attach.",
+            "Re-check in 4 weeks; expand only if early adds/retention are positive."
+        ]
+        why   = ["Directional signal is good, but sample is thin — change carefully and validate fast."]
+    elif section_key == "keep":
+        title = "KEEP & MONITOR — Already best ≤ constraints"
+        steps = [
+            "Keep current zone (it’s already best under never-up-zone and guardrails).",
+            "Watch movers: up/down moves with contraction can signal service or mix issues.",
+            "Re-run monthly; only change if better evidence emerges."
+        ]
+        why   = ["Changing would add risk without better evidence right now."]
+    else:  # investigate_loss
+        title = "INVESTIGATE — Loss Attack (thin evidence, big losses)"
+        steps = [
+            "Pick 3–5 target accounts per combo with biggest YoY loss.",
+            "Run a guarded pilot toward the What-If/Recommended zone.",
+            "Add non-price levers (mix, line adds, perks) to stabilize quickly.",
+            "Decide in 4–6 weeks: promote, pivot, or pause."
+        ]
+        why   = ["These combos bleed the most pounds — action beats waiting; pilot contains risk.", *why_common.get(goal, [])]
+    return title, steps, why
+
+def _goal_from_cfg(cfg):
+    try:
+        return str(cfg.get("priorities", {}).get("optimize_for", "balanced")).lower()
+    except Exception:
+        return "balanced"
+    
+def _render_cover_cheatsheet_page(pdf, *, goal="balanced", region=None, company=None):
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    ax.axis("off")
+    title = "Next Steps — Price Zone Rescue"
+    scope_bits = []
+    if region:  scope_bits.append(f"Region: {region}")
+    if company: scope_bits.append(f"Company: {company}")
+    subtitle = " | ".join(scope_bits) if scope_bits else "All regions & companies"
+    ax.text(0.05, 0.88, title, fontsize=22, weight='bold', transform=ax.transAxes)
+    ax.text(0.05, 0.83, subtitle, fontsize=12, transform=ax.transAxes)
+
+    ax.text(0.05, 0.76, "Use this report without any dashboard:", fontsize=12, weight='bold', transform=ax.transAxes)
+
+    ax.text(0.06, 0.71, "If your goal is VOLUME:", fontsize=11, weight='bold', transform=ax.transAxes)
+    ax.text(0.08, 0.67, "→ Work the QUICK WINS first, then PILOT.", fontsize=11, transform=ax.transAxes)
+
+    ax.text(0.06, 0.61, "If your goal is MARGIN SAFETY:", fontsize=11, weight='bold', transform=ax.transAxes)
+    ax.text(0.08, 0.57, "→ Focus on KEEP & MONITOR and watch 'Reactive' items.", fontsize=11, transform=ax.transAxes)
+
+    ax.text(0.06, 0.51, "If your goal is STOPPING LOSSES:", fontsize=11, weight='bold', transform=ax.transAxes)
+    ax.text(0.08, 0.47, "→ Work INVESTIGATE — LOSS ATTACK right away.", fontsize=11, transform=ax.transAxes)
+
+    ax.text(0.05, 0.40, "How to read table columns (short):", fontsize=12, weight='bold', transform=ax.transAxes)
+    bullets = [
+        "Rank — priority (1 = do first).",
+        "Loss (lbs) — YoY pounds lost (bigger = worse).",
+        "Rec Growth — % customers growing in the recommended zone (higher is better).",
+        "Rec Repeat — % customers that return (higher is stickier).",
+        "Rec Bleed — % contracting (lower is better).",
+        "Movers % — % of customers changing zones.",
+        "Reactive? — 'Reactive – price cut failed' = down-zone didn’t stop contraction."
+    ]
+    y = 0.36
+    for b in bullets:
+        ax.text(0.06, y, f"• {b}", fontsize=11, transform=ax.transAxes)
+        y -= 0.04
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _render_legend_page(pdf):
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    ax.axis("off")
+    ax.set_title("Legend & Glossary — What each column means", loc="left", fontsize=16, pad=10)
+
+    items = [
+        ("Rank", "Overall priority (1 = top action)."),
+        ("Combo", "Cuisine | Company pair you’ll work."),
+        ("Cur / Rec", "Current Zone / Recommended Zone to use under guardrails."),
+        ("Action", "Change or Keep — what to do now."),
+        ("Evidence", "Strength behind the recommendation: Switch (strong), Pilot (medium), Investigate (thin)."),
+        ("Loss (lbs)", "YoY pounds lost; we sort big losses first to get fast recovery."),
+        ("Rec Growth", "Share of customers growing in the recommended zone (higher is better)."),
+        ("Rec Repeat", "Share of customers that repeat (stickier demand; higher is better)."),
+        ("Rec Bleed", "Share contracting in the recommended zone (lower is better)."),
+        ("Movers %", "Percent of customers switching zones (context for stability)."),
+        ("Reactive?", "‘Reactive – price cut failed’ = when customers moved down to a cheaper zone but still contracted. "
+                      "We compute this as: Moved_Down_Contracted_Count / Movers_Count ≥ 50%.")
+    ]
+
+    y = 0.86
+    for name, desc in items:
+        ax.text(0.03, y, f"{name}", fontsize=11, weight="bold", transform=ax.transAxes)
+        ax.text(0.18, y, f"— {desc}", fontsize=11, transform=ax.transAxes)
+        y -= 0.05
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+def make_next_steps_pdf(
+    summary_df, path, *,
+    top_k=15, region=None, company=None,
+    action_change="Change", action_keep="Keep"
+):
+    df = summary_df.copy()
+    df = _subset_for_filter(df, region=region, company=company)
+
+    # Clean key strings (robust to blanks)
+    for col in ["Rec_Action","Evidence_Bucket"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str).str.strip()
+
+    # Buckets
+    change_switch = df[(df["Rec_Action"]==action_change) & (df["Evidence_Bucket"]=="Switch")]
+    change_pilot  = df[(df["Rec_Action"]==action_change) & (df["Evidence_Bucket"]=="Pilot")]
+    change_invest = df[(df["Rec_Action"]==action_change) & (df["Evidence_Bucket"]=="Investigate")]
+    keep_hot      = df[(df["Rec_Action"]==action_keep)   & (df["Evidence_Bucket"].isin(["Switch","Pilot"]))]
+    investigate_loss = df[(df["Evidence_Bucket"]=="Investigate") & (df.get("Loss_Attack_Flag",0)==1)]
+
+    # Goal (for playbooks)
+    goal = _goal_from_cfg(globals().get("cfg", {})) if "cfg" in globals() else "balanced"
+
+    # Region rollup (optional)
+    reg_roll = pd.DataFrame()
+    if all(c in df.columns for c in ["Company Region Name","LossMag"]):
+        reg_roll = (
+            df.groupby("Company Region Name", dropna=False)
+              .agg(
+                  Combos    = ("Combo Key","nunique"),
+                  QuickWins = ("Rec_Action", lambda s: int(((s==action_change) &
+                                                           (df.loc[s.index,"Evidence_Bucket"]=="Switch")).sum())),
+                  PilotNow  = ("Rec_Action", lambda s: int(((s==action_change) &
+                                                           (df.loc[s.index,"Evidence_Bucket"]=="Pilot")).sum())),
+                  ChangeThin= ("Rec_Action", lambda s: int(((s==action_change) &
+                                                           (df.loc[s.index,"Evidence_Bucket"]=="Investigate")).sum())),
+                  LossMag   = ("LossMag","sum")
+              )
+              .reset_index()
+              .sort_values(["QuickWins","PilotNow","ChangeThin","LossMag"],
+                           ascending=[False,False,False,False])
+              .head(10)
+        )
+
+    with PdfPages(path) as pdf:
+        # 1) Cover cheat sheet
+        _render_cover_cheatsheet_page(pdf, goal=goal, region=region, company=company)
+
+        # 2) Table blocks + instruction pages
+        blocks = [
+            ("quick_wins",      change_switch,     "QUICK WINS — Change now (Switch evidence)"),
+            ("pilot",           change_pilot,      "PILOT NOW — Change with a pilot (Pilot evidence)"),
+            ("change_thin",     change_invest,     "CHANGE — Investigate evidence (thin, but directionally strong)"),
+            ("investigate_loss",investigate_loss,  "INVESTIGATE — Loss Attack (thin evidence, big losses)"),
+            ("keep",            keep_hot,          "KEEP & MONITOR — Already best ≤ constraints (watch list)"),
+        ]
+
+         # Table + Playbook sections (each: table page(s) → instruction page)
+        sections = [
+            ("quick_wins",      change_switch,    "QUICK WINS — Change now (Switch evidence)"),
+            ("pilot",           change_pilot,     "PILOT NOW — Change with a pilot (Pilot evidence)"),
+            ("change_thin",     change_invest,    "CHANGE — Investigate evidence (thin, but directionally strong)"),
+            ("investigate_loss",investigate_loss, "INVESTIGATE — Loss Attack (thin evidence, big losses)"),
+            ("keep",            keep_hot,         "KEEP & MONITOR — Already best ≤ constraints (watch list)"),
+        ]
+
+        # Prefer narrow Rank / wide Combo on the tables
+        col_widths = {"Rank": 0.08, "Combo": 0.40}
+
+        # Pick playbook goal from config (fallback to 'balanced')
+        goal = _goal_from_cfg(globals().get("cfg", {})) if "cfg" in globals() else "balanced"
+
+        for key, subdf, title in sections:
+            if subdf.empty:
+                continue
+
+            ranked = subdf.sort_values(
+                ["LossMag", "Rescue Priority Rank"], ascending=[False, True]
+            ).head(top_k)
+
+            pretty = _prettify_block(ranked) if "_prettify_block" in globals() else ranked
+
+            # 1) table pages (no note so nothing overlays)
+            _render_table_page(
+                pdf,
+                pretty,
+                title,
+                note=None,
+                max_rows=18
+            )
+
+            # 2) instruction/playbook page
+            pb_title, pb_steps, pb_why = _playbook_for_section(key, goal=goal)
+            _render_instruction_page(pdf, pb_title, pb_steps, pb_why)
+
+
+        # 3) Region rollup (if available)
+        if not reg_roll.empty:
+            _render_table_page(pdf, reg_roll, "WHERE TO WORK FIRST — Region rollup (top 10)",
+                               note="Sort: QuickWins, PilotNow, ChangeThin, LossMag", max_rows=20)
+    
+        # 4) Legend / glossary (always last)
+        _render_legend_page(pdf)
+        
+        # 5) Detailed glossary (optional but recommended)
+        _render_glossary_page(pdf)
+
+
+    return path
+
+CONFIG_PATH = "config.json"
+
+DEFAULTS = {
+    "priorities": {
+        "weight_bleed": 1.00,
+        "weight_loss_mag": 0.75,
+        "weight_active": 0.50,
+        "weight_size": 0.25,
+        "optimize_for": "balanced"
+    },
+    "price_rules": {
+        "never_upzone": True,
+        "exclude_zone_zero": True
+    },
+    "evidence": {
+        "switch_min_active": 20,
+        "pilot_min_active": 5
+    },
+    "loss_attack": {
+        "top_loss_percentile": 0.80,
+        "min_abs_loss_lbs": 2000
+    },
+    "tie_breakers": {
+        "order": ["GrowthShare", "RepeatShare_Strong", "RepeatShare_IntraYear", "Active_Customers_CY"]
+    },
+    "actions": {
+        "action_labels": {"change": "Change", "keep": "Keep"},
+        "separate_action_from_evidence": True
+    },
+    "pdf": {
+        "make_next_steps_pdf": True,
+        "top_k_actions": 15,
+        "filter_region": None,
+        "filter_company": None
+    },
+    "filters": {
+        "drop_discount_exceptions": False,
+        "limit_cpa_price_source": True
+    }
+}
+
+def _deep_merge(base: dict, add: dict) -> dict:
+    out = dict(base)
+    for k, v in (add or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+def load_config(path=CONFIG_PATH) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            user_cfg = json.load(f)
+    except FileNotFoundError:
+        user_cfg = {}
+    except Exception as e:
+        print(f"⚠️ config.json parse issue: {e}. Using defaults.")
+        user_cfg = {}
+    cfg = _deep_merge(DEFAULTS, user_cfg)
+
+    # Optional tweak by optimize_for
+    opt = cfg.get("priorities", {}).get("optimize_for","balanced").lower()
+    w = cfg["priorities"]
+    if opt == "margin":
+        w["weight_bleed"] = max(w["weight_bleed"], 1.20)
+    elif opt == "pounds":
+        w["weight_loss_mag"] = max(w["weight_loss_mag"], 1.10)
+        w["weight_size"]     = max(w["weight_size"], 0.35)
+    elif opt == "growth":
+        w["weight_active"]   = max(w["weight_active"], 0.65)
+
+    return cfg
+
+def _render_glossary_page(pdf):
+    fig, ax = plt.subplots(figsize=(11, 8.5))
+    ax.axis("off")
+    ax.set_title("Glossary — How to read this report", loc="left", fontsize=16, pad=10)
+
+    bullets = [
+        ("Rank", "Overall rescue priority (1 = work first)."),
+        ("Combo", "Cuisine | Company grouping you are fixing."),
+        ("Cur / Rec", "Current vs. Recommended price zone (under guardrails)."),
+        ("Action", "Change (move to Rec) or Keep (stay in Cur)."),
+        ("Evidence", "Switch (strong), Pilot (medium), Investigate (thin)."),
+        ("Loss (lbs)", "Year-over-year pound loss to recover."),
+        ("Rec Growth / Repeat / Bleed", "Expected share metrics in the Rec zone (higher Growth/Repeat, lower Bleed is better)."),
+        ("Movers %", "Share of base that changed main zone YoY."),
+        ("Reactive?", "⚠ means many contracted after moving down → risk of reactive downshifts; stabilize before changing."),
+    ]
+    y = 0.86
+    for name, desc in bullets:
+        ax.text(0.05, y, f"• {name} — {desc}", fontsize=11, transform=ax.transAxes)
+        y -= 0.05
+
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+# ---------- Main ----------
+def main():
+    # --- parse CLI ---
+    args = parse_args()
+
+    # --- optional wizard ---
+    if args.init_config:
+        run_config_wizard(args.config)
+        return  # stop after writing config
+
+    # --- load config file (path may come from --config) ---
+    cfg = load_config(args.config)
+
+    # Apply config -> globals
+    global EVID_SWITCH_MIN, EVID_PILOT_MIN
+    EVID_SWITCH_MIN = int(cfg["evidence"]["switch_min_active"])
+    EVID_PILOT_MIN  = int(cfg["evidence"]["pilot_min_active"])
+
+    global NEVER_UPZONE, EXCLUDE_ZONE_ZERO
+    NEVER_UPZONE      = bool(cfg["price_rules"]["never_upzone"])
+    EXCLUDE_ZONE_ZERO = bool(cfg["price_rules"]["exclude_zone_zero"])
+
+    global LOSS_ATTACK_PCT, LOSS_ATTACK_MIN_LBS
+    LOSS_ATTACK_PCT     = float(cfg["loss_attack"]["top_loss_percentile"])
+    LOSS_ATTACK_MIN_LBS = float(cfg["loss_attack"]["min_abs_loss_lbs"])
+
+    global PRIO_WEIGHTS
+    PRIO_WEIGHTS = {
+        "BleedComp": float(cfg["priorities"]["weight_bleed"]),
+        "LossMag":   float(cfg["priorities"]["weight_loss_mag"]),
+        "Active":    float(cfg["priorities"]["weight_active"]),
+        "Size":      float(cfg["priorities"]["weight_size"]),
+    }
+
+    global ACTION_CHANGE, ACTION_KEEP, TIE_ORDER
+
+    ACTION_CHANGE = str(cfg["actions"]["action_labels"]["change"])
+    ACTION_KEEP   = str(cfg["actions"]["action_labels"]["keep"])
+    TIE_ORDER     = list(cfg["tie_breakers"]["order"])
+
+    global MAKE_NEXT_STEPS_PDF, TOP_K_ACTIONS, FILTER_REGION, FILTER_COMPANY, NEXT_STEPS_PDF
+    MAKE_NEXT_STEPS_PDF = bool(cfg["pdf"]["make_next_steps_pdf"])
+    TOP_K_ACTIONS       = int(cfg["pdf"]["top_k_actions"])
+    FILTER_REGION       = cfg["pdf"]["filter_region"]
+    FILTER_COMPANY      = cfg["pdf"]["filter_company"]
+
+    # Optional upstream filters (defined before use)
+    def apply_source_filters(df):
+        g = df.copy()
+        if cfg["filters"]["limit_cpa_price_source"] and "Price Source Type" in g.columns:
+            g = g[g["Price Source Type"].astype(str).str.upper().eq("CPA")]
+        if cfg["filters"]["drop_discount_exceptions"]:
+            for col in ["Exception Flag","Discount Flag"]:
+                if col in g.columns:
+                    g = g[~g[col].astype(str).str.upper().isin(["1","Y","TRUE","YES"])]
+        return g
+
+    
+    # current_map 
+    src = os.path.join(SOURCE_FOLDER, FILENAME)
+    df  = load_data(src)
+    if df.empty:
+        print("❌ No data."); return
+    df  = apply_source_filters(df)  # << applies CPA-only, removes exceptions if requested
+
+    # Current zone, customers & zone metrics
+    current_map = compute_current_zone(df)
+    cust        = customer_totals_and_main_zones(df)
+    z_table     = zone_metrics_from_customers(cust)
+    picks = pick_zones(z_table, current_map, tie_order=TIE_ORDER,
+                   action_keep=ACTION_KEEP, action_change=ACTION_CHANGE)
+
+    # Combo-level priority & loss attack
+    combos = combo_priority_inputs(df, cust)
+    combos = add_priority(combos)
+
+    # Coverage flags
+    cov = coverage_flags(df)
+
+    # Customer transitions + summary
+    trans_detail, trans_summary = compute_customer_zone_transitions(df)
+    trans_path = os.path.join(SOURCE_FOLDER, TRANS_CSV)
+    if has_rows(trans_detail):
+        trans_detail.to_csv(trans_path, index=False)
+        print(f"📄 Saved customer transitions: {trans_path}")
+    else:
+        print("ℹ️ No customer transitions computed (missing IDs or zones).")
+
+    # Merge for summary
+    outdf = (combos.merge(picks, on="Combo Key", how="left")
+                   .merge(current_map, on="Combo Key", how="left", suffixes=("","_dup"))
+                   .merge(cov, on="Combo Key", how="left")
+                   .merge(trans_summary, on="Combo Key", how="left"))
+
+    # Movement shares & reactive downshift
+    outdf["Combo Key"] = outdf["Combo Key"].astype(str)
+    for c in ["Movers_Count","Moved_Up_Count","Moved_Down_Count",
+              "Moved_Up_Grew_Count","Moved_Up_Contracted_Count",
+              "Moved_Down_Grew_Count","Moved_Down_Contracted_Count"]:
+        if c not in outdf.columns: outdf[c] = 0
+        outdf[c] = outdf[c].fillna(0).astype(int)
+
+    base = outdf["Base_Customers_Combo"].replace(0, np.nan)
+    outdf["Movers_Share_of_Base"]                = (outdf["Movers_Count"] / base).round(4)
+    outdf["Moved_Up_Grew_Share_of_Base"]         = (outdf["Moved_Up_Grew_Count"] / base).round(4)
+    outdf["Moved_Down_Contracted_Share_of_Base"] = (outdf["Moved_Down_Contracted_Count"] / base).round(4)
+
+    mov = outdf["Movers_Count"].replace(0, np.nan)
+    down_contract_share = (outdf["Moved_Down_Contracted_Count"] / mov).fillna(0)
+    outdf["Reactive_Downshift_Likely"] = (down_contract_share >= REACTIVE_DOWN_CONTRACTED_THRESH).astype(int)
+
+    # Movement by zone & attach
+    zmove = zone_movement_summary_from_transitions(trans_detail)
+    export_if_rows(zmove, os.path.join(SOURCE_FOLDER, ZMOVE_CSV))
+    outdf = attach_current_and_rec_zone_movement(outdf, zmove, current_map, picks)
+
+    # Attack plan  ✅ pass your labels
+    outdf["Attack_Plan"] = build_attack_plan(outdf, action_change=ACTION_CHANGE, action_keep=ACTION_KEEP)
+
+    # ===== Schema compatibility guard (keep PBI visuals happy) =====
+    REQUIRED_SUMMARY_COLS = [
+        # Movement fields used on Combo Detail page (Recommended)
+        "RecZone_Adds_Grew", "RecZone_Adds", "RecZone_Exits", "RecZone_Net_Adds", "RecZone_Stays",
+        "RecZone_Adds_New", "RecZone_Adds_From_Higher", "RecZone_Adds_From_Lower",
+        "RecZone_Exits_To_Higher", "RecZone_Exits_To_Lower",
+        "RecZone_Adds_Share_of_CYBase", "RecZone_Exits_Share_of_PYBase",
+
+        # Movement fields (Current)
+        "CurZone_Adds_Grew", "CurZone_Adds", "CurZone_Exits", "CurZone_Net_Adds", "CurZone_Stays",
+        "CurZone_Adds_New", "CurZone_Adds_From_Higher", "CurZone_Adds_From_Lower",
+        "CurZone_Exits_To_Higher", "CurZone_Exits_To_Lower",
+        "CurZone_Adds_Share_of_CYBase", "CurZone_Exits_Share_of_PYBase",
+
+        # Legacy Top/Low/WhatIf counts used on Page 1 table
+        "Top_Growth_BaseCustomers","Top_Growth_ActiveCustomers_CY",
+        "Low_Bleed_BaseCustomers","Low_Bleed_ActiveCustomers_CY",
+        "WhatIf_BaseCustomers","WhatIf_ActiveCustomers_CY",
+
+        # Buckets & flags used in slicers
+        "Evidence_Bucket","Reactive_Downshift_Likely","Has_Unused_Zones",
+        "Observed_Zones_Count","Coverage_Fraction"
+    ]
+    for _c in REQUIRED_SUMMARY_COLS:
+        if _c not in outdf.columns:
+            # numeric-looking fields -> NaN; text-looking -> empty string
+            outdf[_c] = np.nan if ("Share" in _c or "Adds" in _c or "Exits" in _c or "Count" in _c) else ""
+
+    # Attack plan
+    outdf["Attack_Plan"] = build_attack_plan(outdf)
+
+    # Export columns
+    cols = [
+        "Combo Key",
+        # Priority / loss
+        "Rescue Priority Rank","RescuePriorityScore",
+        "Loss_Attack_Flag","LossMag","LossMag_pct",
+        "BleedComp","Total_Pounds_CY","Active_Customers_CY_Combo","Base_Customers_Combo",
+        "AtRisk_Customers_Combo","AtRisk_Share_Combo",
+        # Picks
+        "Current Zone Suffix","Recommended Zone Suffix","Rec_Action","Evidence_Bucket","Evidence_Insufficient","Rec_Note",
+        "Rec_GrowthShare","Rec_BleedRate","Rec_RepeatShare","Rec_BaseCustomers","Rec_ActiveCustomers_CY",
+        "Top_Growth_Zone","Top_Growth_GrowthShare","Top_Growth_BleedRate","Top_Growth_RepeatShare",
+        "Top_Growth_BaseCustomers","Top_Growth_ActiveCustomers_CY",
+        "Low_Bleed_Zone","Low_Bleed_BleedRate","Low_Bleed_GrowthShare","Low_Bleed_RepeatShare",
+        "Low_Bleed_BaseCustomers","Low_Bleed_ActiveCustomers_CY",
+        "Uncapped_WhatIf_Zone","WhatIf_GrowthShare","WhatIf_BleedRate","WhatIf_RepeatShare",
+        "WhatIf_BaseCustomers","WhatIf_ActiveCustomers_CY",
+        # Coverage
+        "Observed_Zones_List","Observed_Zones_Count","Missing_Zones_List","Coverage_Fraction","Has_Unused_Zones",
+        # Movement summary (combo level)
+        "Movers_Count","Moved_Up_Count","Moved_Down_Count",
+        "Moved_Up_Grew_Count","Moved_Up_Contracted_Count",
+        "Moved_Down_Grew_Count","Moved_Down_Contracted_Count",
+        "Movers_Share_of_Base","Moved_Up_Grew_Share_of_Base","Moved_Down_Contracted_Share_of_Base",
+        "Reactive_Downshift_Likely",
+        # Current zone movement (attached)
+        "CurZone_CY_Base_Main","CurZone_PY_Base_Main",
+        "CurZone_Adds","CurZone_Exits","CurZone_Net_Adds","CurZone_Stays",
+        "CurZone_Adds_New","CurZone_Adds_From_Higher","CurZone_Adds_From_Lower",
+        "CurZone_Exits_To_Higher","CurZone_Exits_To_Lower",
+        "CurZone_Adds_Grew","CurZone_Exits_Contracted",
+        "CurZone_Adds_Share_of_CYBase","CurZone_Exits_Share_of_PYBase",
+        # Recommended zone movement (attached)
+        "RecZone_CY_Base_Main","RecZone_PY_Base_Main",
+        "RecZone_Adds","RecZone_Exits","RecZone_Net_Adds","RecZone_Stays",
+        "RecZone_Adds_New","RecZone_Adds_From_Higher","RecZone_Adds_From_Lower",
+        "RecZone_Exits_To_Higher","RecZone_Exits_To_Lower",
+        "RecZone_Adds_Grew","RecZone_Exits_Contracted",
+        "RecZone_Adds_Share_of_CYBase","RecZone_Exits_Share_of_PYBase",
+        # Plan
+        "Attack_Plan"
+    ]
+    cols = [c for c in cols if c in outdf.columns]
+
+    summary_path = os.path.join(SOURCE_FOLDER, SUMMARY_CSV)
+    outdf[cols].to_csv(summary_path, index=False)
+
+    # Convenience saves
+    if has_rows(zmove):
+        zmove_path = os.path.join(SOURCE_FOLDER, ZMOVE_CSV); zmove.to_csv(zmove_path, index=False)
+    else:
+        zmove_path = "(no zmove rows)"
+
+    # Recommended movement convenience file
+    def col_has_values(df, col) -> bool:
+        return has_rows(df) and (col in df.columns) and df[col].notna().any()
+
+    if has_rows(zmove) and col_has_values(picks, "Recommended Zone Suffix"):
+        zmove["Zone"] = zmove["Zone"].astype(str)
+        picks["Recommended Zone Suffix"] = picks["Recommended Zone Suffix"].astype(str)
+
+        rec = zmove.merge(
+            picks[["Combo Key","Recommended Zone Suffix"]].rename(columns={"Recommended Zone Suffix":"Zone"}),
+            on=["Combo Key","Zone"], how="inner"
+        )
+        rec = rec.drop(columns=["Zone"]).add_prefix("RecZone_")
+        rec = picks[["Combo Key"]].drop_duplicates().merge(
+            rec, left_on="Combo Key", right_on="RecZone_Combo Key", how="left"
+        ).drop(columns=["RecZone_Combo Key"])
+        export_if_rows(rec, os.path.join(SOURCE_FOLDER, REC_CSV))
+    else:
+        pass
+    
+    # Make Next Steps PDF(s)
+    if MAKE_NEXT_STEPS_PDF:
+        scope_df = outdf.copy()
+
+        # Overall or filtered (single PDF)
+        pdf_scope = _subset_for_filter(scope_df, region=FILTER_REGION, company=FILTER_COMPANY)
+        try:
+            pdf_path = os.path.join(SOURCE_FOLDER, NEXT_STEPS_PDF)
+            made = make_next_steps_pdf(
+                outdf, pdf_path,
+                top_k=TOP_K_ACTIONS,
+                region=FILTER_REGION,
+                company=FILTER_COMPANY,
+                action_change=ACTION_CHANGE,
+                action_keep=ACTION_KEEP
+            )
+            print("📄 Next Steps PDF:", made)
+            open_file(made)
+        except Exception as e:
+            print("⚠️ Next Steps PDF error:", e)
+
+
+    print("✅ Saved:")
+    print(" -", summary_path)
+    print(" -", zmove_path)
+    print(" -", os.path.join(SOURCE_FOLDER, TRANS_CSV))
+
+
+if __name__ == "__main__":
+    main()
