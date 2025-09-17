@@ -1,0 +1,52 @@
+{
+  "profile": {
+    "owner_name": "Karen",
+    "purpose": "Triage, stabalize bleed"
+  },
+  "priorities": {
+    "weight_bleed": 1.25,
+    "weight_loss_mag": 0.67,
+    "weight_active": 0.67,
+    "weight_size": 0.96,
+    "optimize_for": "pounds"
+  },
+  "price_rules": {
+    "never_upzone": true,
+    "exclude_zone_zero": true
+  },
+  "evidence": {
+    "switch_min_active": 20,
+    "pilot_min_active": 5
+  },
+  "loss_attack": {
+    "top_loss_percentile": 0.8,
+    "min_abs_loss_lbs": 2000.0
+  },
+  "tie_breakers": {
+    "order": [
+      "GrowthShare",
+      "RepeatShare_Strong"
+    ]
+  },
+  "actions": {
+    "action_labels": {
+      "change": "Change",
+      "keep": "Keep"
+    },
+    "separate_action_from_evidence": true
+  },
+  "pdf": {
+    "make_next_steps_pdf": true,
+    "top_k_actions": 10,
+    "filter_region": null,
+    "filter_company": "Central Texas"
+  },
+  "filters": {
+    "drop_discount_exceptions": true,
+    "limit_cpa_price_source": true
+  },
+  "goals": {
+  "margin_yoy_target": 0.04,
+  "volume_yoy_target": 0.025
+}
+}
