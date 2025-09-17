@@ -1,0 +1,686 @@
+"""
+KNS Agent 2.0 — Agentic Zone Optimization Skeleton
+--------------------------------------------------
+Purpose: Evolve the prior KNS script into an "agent" that observes weekly data,
+reasons with business rules + utility scoring, acts via prescriptive zone recs,
+and learns from outcomes (memory), all with auditable logs.
+
+Assumptions:
+- Work at Combo Key level (Attribute Group ID + NPD Cuisine Type + NPD DMA + Company Number)
+- Columns include (at minimum):
+    'Attribute_Group_ID', 'NPD_Cuisine_Type', 'NPD_DMA', 'Company_Number',
+    'Current_Zone', 'Rec_Zone', 'Volume_LB_CY', 'Volume_LB_LY',
+    'Computer_Margin_$_Per_LB_CY', 'Computer_Margin_$__Per_LB_LY',
+    'Delta_Pounds_YoY', 'Delta_Computer_Margin_Per_LB_YoY',
+    'Exceptions_Flag', 'Business_Center_Flag', 'Weeks_Observed',
+    'Evidence_Active_Customers_RecZone',
+    # (plus any site/region metadata)
+- Goals: YoY margin ≥ 4%, volume ≥ 2.5% at the portfolio level (configurable)
+- Exclude exceptions from *evidence* (we can still show them for awareness)
+
+This is a skeleton you can adapt to your real schema. Focus is on structure,
+agent loop, and auditable decisions.
+"""
+from __future__ import annotations
+import os
+import json
+import uuid
+import time
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Tuple, Dict
+import hashlib
+import pandas as pd
+from kns_core import (
+    load_data,
+    compute_current_zone, customer_totals_and_main_zones,
+    zone_metrics_from_customers, pick_zones, combo_priority_inputs,
+    add_priority, coverage_flags, compute_customer_zone_transitions,
+    zone_movement_summary_from_transitions, attach_current_and_rec_zone_movement,
+    build_attack_plan
+)
+
+# ===================== CONFIG =====================  
+def load_and_prepare(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    # --- Current Zone from Price Zone ID ---
+    def zone_from_price_id(x: str) -> str:
+        if pd.isna(x):
+            return None
+        s = str(x).strip()
+        if "-" in s:
+            return s.split("-", 1)[1]  # take the suffix after the dash
+        return s
+    df["Current_Zone"] = df["Price Zone ID"].apply(zone_from_price_id)
+
+    # --- Ensure deltas are numeric ---
+    for col in [
+        "Delta Computer Margin Per LB YoY",
+        "Delta Pounds YoY"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # --- Evidence active customers (default to 0 if missing) ---
+    if "Evidence_Active_Customers_RecZone" not in df.columns:
+        df["Evidence_Active_Customers_RecZone"] = 0
+
+    # --- Weeks observed (default 0 if missing) ---
+    if "Weeks_Observed" not in df.columns:
+        df["Weeks_Observed"] = 0
+
+    # --- Exceptions flag (default False if missing) ---
+    if "Exceptions_Flag" not in df.columns:
+        df["Exceptions_Flag"] = 0
+
+    # --- Build a leader-friendly Combo Key (names not numbers) ---
+    df["Combo_Key_Human"] = (
+        df["Attribute Group Name"].astype(str).str.strip().str.upper()
+        + "::" +
+        df["NPD Cuisine Type"].astype(str).str.strip().str.upper()
+        + "::" +
+        df["Company Name"].astype(str).str.strip().str.upper()
+    )
+
+    return df
+  
+@dataclass
+class AgentConfig:
+    goal_margin_yoy: float = 0.04
+    goal_volume_yoy: float = 0.025
+    evid_switch_min: int = 20
+    evid_pilot_min: int = 5
+    w_margin: float = 0.6
+    w_volume: float = 0.4
+    exclude_exceptions_from_evidence: bool = True
+    require_weeks_observed: int = 6
+
+    # EXACT CSV column names (no underscores)
+    col_margin_delta: str = 'Delta Computer Margin Per LB YoY'
+    col_volume_delta: str = 'Delta Pounds YoY'
+    col_current_zone: str = 'Current_Zone'
+    col_rec_zone: str = 'Rec_Zone'
+    col_weeks: str = 'Weeks_Observed'
+    col_exc: str = 'Exceptions_Flag'
+    col_evid_active: str = 'Evidence_Active_Customers_RecZone'
+
+    # Exceptions in your CSV:
+    # - "Exception Ext % of Net Sales CY" (percent string like "0.00%")
+    # - "Exception Ext $ Per LB CY" (dollar-per-lb)
+    col_exceptions_rate: str = 'Exception Ext % of Net Sales CY'
+    col_exceptions_share: str = 'Exception Ext $ Per LB CY'
+
+    # Margin floor (optional; only used if present)
+    col_margin_floor_p25: str = 'MarginLB_P25_DMAxCuisinexAG_52w'
+    col_marginlb_cy: str = 'Computer Margin $ Per LB CY'
+
+    # Leader-friendly combo key parts
+    combo_cols: Tuple[str, ...] = ('Attribute Group Name','NPD Cuisine Type', 'Company Name')
+
+    outdir: str = 'agent_outputs'
+    memory_csv: str = 'agent_outputs/kns_memory.csv'
+    audit_csv: str = 'agent_outputs/kns_audit_log.csv'
+    timestamp: str = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+def load_external_cfg(path="config.json") -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+    
+# ===================== UTILITIES =====================
+
+def _ensure_outdir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _safe_div(n: float, d: float) -> float:
+    return float(n) / float(d) if d else 0.0
+
+
+# ===================== MEMORY LAYER =====================
+class MemoryStore:
+    """Append-only store of past actions & observed outcomes.
+    Schema (minimal):
+      combo_key_hash, date, action, planned_zone, prev_zone,
+      expected_utility, observed_margin_delta, observed_volume_delta
+    """
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        _ensure_outdir(cfg.outdir)
+        if not os.path.exists(cfg.memory_csv):
+            pd.DataFrame(columns=[
+                'combo_key_hash','date','action','planned_zone','prev_zone',
+                'expected_utility','observed_margin_delta','observed_volume_delta'
+            ]).to_csv(cfg.memory_csv, index=False)
+
+    @staticmethod
+    def _hash_combo(row: pd.Series, combo_cols: Tuple[str, ...]) -> str:
+        key = '::'.join(str(row.get(c, '')).strip().upper() for c in combo_cols)
+        return hashlib.sha1(key.encode('utf-8')).hexdigest()
+
+
+    def append(self, df_actions: pd.DataFrame) -> None:
+        if df_actions.empty:
+            return
+        # Only the required columns; ignore extras
+        cols = [
+            'combo_key_hash','date','action','planned_zone','prev_zone',
+            'expected_utility','observed_margin_delta','observed_volume_delta'
+        ]
+        df = df_actions.copy()
+        df = df[[c for c in cols if c in df.columns]]
+        df.to_csv(self.cfg.memory_csv, mode='a', header=False, index=False)
+
+    def load(self) -> pd.DataFrame:
+        try:
+            return pd.read_csv(self.cfg.memory_csv)
+        except Exception:
+            return pd.DataFrame()
+
+
+# ===================== OBSERVE =====================
+class Observer:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+
+    @staticmethod
+    def _to_percent(series: pd.Series) -> pd.Series:
+        """Accepts things like '3.4%' or '0.034' or 0.034; returns float fraction [0..1]."""
+        s = series.astype(str).str.strip()
+        has_pct = s.str.endswith('%')
+        # strip % then to number
+        s_num = pd.to_numeric(s.str.replace('%', '', regex=False), errors='coerce')
+        # if it had a %, divide by 100; otherwise assume already a fraction or plain number
+        out = s_num.where(~has_pct, s_num / 100.0)
+        return out.astype(float)
+
+    def load_week(self, df_week: pd.DataFrame) -> pd.DataFrame:
+        df = df_week.copy()
+
+        # Key hash (leader-friendly names already in config combo_cols)
+        df['combo_key_hash'] = df.apply(lambda r: MemoryStore._hash_combo(r, self.cfg.combo_cols), axis=1)
+
+        # Make sure the two deltas are numeric
+        for c in [self.cfg.col_margin_delta, self.cfg.col_volume_delta]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        # Weeks observed / evidence actives — default if missing
+        if self.cfg.col_weeks not in df.columns:
+            df[self.cfg.col_weeks] = 0
+        else:
+            df[self.cfg.col_weeks] = pd.to_numeric(df[self.cfg.col_weeks], errors='coerce').fillna(0).astype(int)
+
+        if self.cfg.col_evid_active not in df.columns:
+            df[self.cfg.col_evid_active] = 0
+        else:
+            df[self.cfg.col_evid_active] = pd.to_numeric(df[self.cfg.col_evid_active], errors='coerce').fillna(0).astype(int)
+
+        # Exceptions: rate to fraction, flag if any
+        if self.cfg.col_exceptions_rate in df.columns:
+            df[self.cfg.col_exceptions_rate] = self._to_percent(df[self.cfg.col_exceptions_rate]).fillna(0.0)
+
+        if self.cfg.col_exc not in df.columns:
+            # make a binary flag from rate if present, else 0
+            if self.cfg.col_exceptions_rate in df.columns:
+                df[self.cfg.col_exc] = (df[self.cfg.col_exceptions_rate] > 0).astype(int)
+            else:
+                df[self.cfg.col_exc] = 0
+
+        return df
+
+# ===================== REASON =====================
+class CPAScorer:
+    """
+    Minimal guardrail checker used by Reasoner.
+    Rules (tune as needed):
+      - Exceptions_Rate <= 5%
+      - Current margin/LB must be >= site P25 floor (if both columns exist)
+      - Evidence thresholds are handled in Reasoner; we just return 'why' here
+    """
+    def __init__(self, cfg: "AgentConfig"):
+        self.cfg = cfg
+
+    def fails_guardrails(self, row: pd.Series) -> tuple[bool, str]:
+        # Exceptions rate guardrail
+        if self.cfg.col_exceptions_rate in row and pd.notna(row[self.cfg.col_exceptions_rate]):
+            try:
+                exc_rate = float(row[self.cfg.col_exceptions_rate])
+                if exc_rate > 0.05:
+                    return True, f"Exceptions rate {exc_rate:.1%} > 5%."
+            except Exception:
+                pass
+
+        # Margin floor guardrail (if both columns present)
+        if (
+            self.cfg.col_marginlb_cy in row and
+            self.cfg.col_margin_floor_p25 in row and
+            pd.notna(row[self.cfg.col_marginlb_cy]) and
+            pd.notna(row[self.cfg.col_margin_floor_p25])
+        ):
+            try:
+                curr_margin_lb = float(row[self.cfg.col_marginlb_cy])
+                p25_floor = float(row[self.cfg.col_margin_floor_p25])
+                if curr_margin_lb < p25_floor:
+                    return True, f"Margin/LB {curr_margin_lb:.4f} below P25 floor {p25_floor:.4f}."
+            except Exception:
+                pass
+
+        return False, ""
+
+class Reasoner:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        self.cpa = CPAScorer(cfg)
+
+    def utility(self, row: pd.Series) -> float:
+        m = float(row.get(self.cfg.col_margin_delta, 0.0))
+        v = float(row.get(self.cfg.col_volume_delta, 0.0))
+        return self.cfg.w_margin * m + self.cfg.w_volume * v
+
+    def categorize(self, row: pd.Series) -> Tuple[str, str]:
+        """Return (action, rationale)
+        Actions: 'Switch', 'PilotNow', 'QuickWin', 'Defer', 'Keep' (no change / hold)
+        Policy:
+          - If rec zone equals current zone → 'Keep'
+          - If weeks < required → 'Defer'
+          - Apply guardrails (exceptions ≤5%, margin floor, evidence)
+          - Evidence thresholds gate 'Switch' vs 'PilotNow'
+          - 'QuickWin' when current already meets goals
+        """
+        curr = row.get(self.cfg.col_current_zone)
+        rec  = row.get(self.cfg.col_rec_zone)
+        weeks = int(row.get(self.cfg.col_weeks, 0))
+        evid = int(row.get(self.cfg.col_evid_active, 0))
+        m = float(row.get(self.cfg.col_margin_delta, 0.0))
+        v = float(row.get(self.cfg.col_volume_delta, 0.0))
+        util = self.utility(row)
+
+        # Already in recommended zone or no rec
+        if pd.isna(rec) or rec == curr:
+            return 'Keep', f"Already in {curr} or no recommendation; util={util:.4f}"
+
+        # Not enough observation window
+        if weeks < self.cfg.require_weeks_observed:
+            return 'Defer', f"Only {weeks} weeks observed (<{self.cfg.require_weeks_observed}); util={util:.4f}"
+
+        # Guardrails
+        fails, why = self.cpa.fails_guardrails(row)
+        if fails:
+            return 'Defer', f"Guardrail: {why}; util={util:.4f}"
+
+        # Evidence gating for Switch/Pilot
+        if evid >= self.cfg.evid_switch_min:
+            return 'Switch', f"Evidence={evid} (>= {self.cfg.evid_switch_min}); util={util:.4f}"
+        if evid >= self.cfg.evid_pilot_min:
+            return 'PilotNow', f"Evidence={evid} (>= {self.cfg.evid_pilot_min}); util={util:.4f}"
+
+        # QuickWin if current meets goals
+        if (m >= self.cfg.goal_margin_yoy) and (v >= self.cfg.goal_volume_yoy):
+            return 'QuickWin', f"Current meets goals (m={m:.4f}, v={v:.4f}); util={util:.4f}"
+
+        return 'Defer', f"Insufficient evidence (evid={evid}); util={util:.4f}"
+
+    def reason(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df['Utility'] = df.apply(self.utility, axis=1)
+        actions, rationales = [], []
+        for _, r in df.iterrows():
+            a, ra = self.categorize(r)
+            actions.append(a)
+            rationales.append(ra)
+        df['Action'] = actions
+        df['Rationale'] = rationales
+        return df
+
+
+# ===================== ACT =====================
+class Actor:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        _ensure_outdir(cfg.outdir)
+
+    def plan(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Prioritize actions for execution.
+        Simple heuristic: sort by Action priority + Utility magnitude + Volume proxy if available.
+        """
+        df = df.copy()
+        # Priority mapping
+        pri = {'Switch': 3, 'PilotNow': 2, 'QuickWin': 1, 'Defer': 0, 'Keep': 0}
+        df['Priority'] = df['Action'].map(pri).fillna(0).astype(int)
+        sort_cols = ['Priority', 'Utility']
+        df = df.sort_values(sort_cols, ascending=[False, False]).reset_index(drop=True)
+        return df
+
+    def export(self, df_planned: pd.DataFrame, cfg: AgentConfig) -> Dict[str, str]:
+        ts = cfg.timestamp
+
+        # Add goals for visibility
+        df_planned = df_planned.copy()
+        df_planned["Goal_Margin_YoY"] = cfg.goal_margin_yoy
+        df_planned["Goal_Volume_YoY"] = cfg.goal_volume_yoy
+
+        paths = {
+            'summary': os.path.join(cfg.outdir, f'KNS_Agent_Summary_{ts}.csv'),
+            'actions': os.path.join(cfg.outdir, f'KNS_Agent_Actions_{ts}.csv'),
+            'defer':   os.path.join(cfg.outdir, f'KNS_Agent_Defer_{ts}.csv'),
+            'audit':   cfg.audit_csv,
+        }
+        df_planned.to_csv(paths['summary'], index=False)
+        df_planned[df_planned['Action'].isin(['Switch','PilotNow','QuickWin'])].to_csv(paths['actions'], index=False)
+        df_planned[df_planned['Action'].isin(['Defer','Keep'])].to_csv(paths['defer'], index=False)
+        return paths
+
+
+
+# ===================== LEARN =====================
+class Learner:
+    """Very simple learning loop: aggregates memory to auto-tune thresholds.
+    Example: if recent Switches underperform, raise evid_switch_min; if they excel, lower it.
+    Keep it conservative and bounded.
+    """
+    def __init__(self, cfg: AgentConfig, memory: MemoryStore):
+        self.cfg = cfg
+        self.memory = memory
+
+    def suggest_thresholds(self) -> Dict[str, int]:
+        df = self.memory.load()
+        if df.empty:
+            return {
+                'evid_switch_min': self.cfg.evid_switch_min,
+                'evid_pilot_min': self.cfg.evid_pilot_min,
+            }
+        # Compute realized utility by action
+        df['realized_util'] = self.cfg.w_margin*df['observed_margin_delta'] + self.cfg.w_volume*df['observed_volume_delta']
+        sw = df[df['action']=='Switch']
+        pt = df[df['action']=='PilotNow']
+        def adj(cur: int, realized: pd.Series, up_step=2, down_step=1) -> int:
+            if realized.empty:
+                return cur
+            mu = realized.mean()
+            # If average realized utility is negative, require more evidence; if strong positive, allow a bit less
+            if mu < 0:
+                return min(cur + up_step, 50)
+            if mu > 0.02:  # generous positive utility
+                return max(cur - down_step, 5)
+            return cur
+        return {
+            'evid_switch_min': adj(self.cfg.evid_switch_min, sw['realized_util']),
+            'evid_pilot_min': adj(self.cfg.evid_pilot_min, pt['realized_util']),
+        }
+
+
+# ===================== AUDIT =====================
+class Auditor:
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        _ensure_outdir(cfg.outdir)
+        if not os.path.exists(cfg.audit_csv):
+            pd.DataFrame(columns=[
+                'run_id','timestamp','combo_key_hash','action','current_zone','rec_zone',
+                'utility','rationale','weeks_observed','evidence_active'
+            ]).to_csv(cfg.audit_csv, index=False)
+
+    def log(self, run_id: str, df: pd.DataFrame):
+        if df.empty:
+            return
+        cols = {
+            'combo_key_hash':'combo_key_hash',
+            'action':'Action',
+            'current_zone':self.cfg.col_current_zone,
+            'rec_zone':self.cfg.col_rec_zone,
+            'utility':'Utility',
+            'rationale':'Rationale',
+            'weeks_observed':self.cfg.col_weeks,
+            'evidence_active':self.cfg.col_evid_active,
+        }
+        out = df.copy()
+        out = out.rename(columns={v:k for k,v in cols.items() if v in out.columns})
+        out['run_id'] = run_id
+        out['timestamp'] = datetime.now().isoformat()
+        out[['run_id','timestamp','combo_key_hash','action','current_zone','rec_zone','utility','rationale','weeks_observed','evidence_active']].to_csv(
+            self.cfg.audit_csv, mode='a', header=False, index=False
+        )
+
+
+# ===================== ORCHESTRATION =====================
+class KNSAgent:
+    def __init__(self, cfg: Optional[AgentConfig] = None, cfg_path="config.json"):
+        self.cfg = cfg or AgentConfig()
+        # overlay external JSON goals
+        external = load_external_cfg(cfg_path)
+        goals = external.get("goals", {})
+        if isinstance(goals, dict):
+            if "margin_yoy_target" in goals:
+                self.cfg.goal_margin_yoy = float(goals["margin_yoy_target"])
+            if "volume_yoy_target" in goals:
+                self.cfg.goal_volume_yoy = float(goals["volume_yoy_target"])
+        # init subsystems
+        self.memory = MemoryStore(self.cfg)
+        self.observer = Observer(self.cfg)
+        self.reasoner = Reasoner(self.cfg)
+        self.actor = Actor(self.cfg)
+        self.learner = Learner(self.cfg, self.memory)
+        self.auditor = Auditor(self.cfg)
+
+    def _build_manager_report(self, df_plan: pd.DataFrame, pit_queue: Optional[pd.DataFrame]=None) -> str:
+        """
+        Writes a simple .md file leaders can read.
+        Includes: goals, quick TL;DR, and the action change log.
+        """
+        os.makedirs(self.cfg.outdir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.cfg.outdir, f"CPA_Manager_Report_{ts}.md")
+
+        # TL;DR
+        if self.cfg.col_exceptions_rate in df_plan.columns:
+            try:
+                exc_rate_mean = float(df_plan[self.cfg.col_exceptions_rate].dropna().mean())
+                cpa_purity = 1.0 - exc_rate_mean
+                cpa_purity_str = f"{cpa_purity:.1%}"
+            except Exception:
+                cpa_purity_str = "—"
+        else:
+            cpa_purity_str = "—"
+
+        # Change log
+        change_df = df_plan[df_plan["Action"].isin(["Switch","PilotNow","QuickWin"])].copy()
+        cols = ["combo_key_hash", self.cfg.col_current_zone, self.cfg.col_rec_zone, "Action", "Rationale", "Utility"]
+        change_cols = [c for c in cols if c in change_df.columns]
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# CPA Manager Report — {ts}\n\n")
+            f.write("## Goals\n")
+            f.write(f"- Margin YoY target: **{self.cfg.goal_margin_yoy:.1%}**\n")
+            f.write(f"- Volume YoY target: **{self.cfg.goal_volume_yoy:.1%}**\n\n")
+
+            f.write("## TL;DR\n")
+            f.write(f"- CPA Purity (1 − Exceptions Rate): **{cpa_purity_str}**\n")
+            f.write(f"- Pit Queue items: **{len(pit_queue) if isinstance(pit_queue, pd.DataFrame) else 0}**\n\n")
+
+            f.write("## Actions This Run\n")
+            if change_df.empty:
+                f.write("_No Switch/Pilot/QuickWin actions in this run._\n")
+            else:
+                # write as a simple table
+                f.write("| " + " | ".join(change_cols) + " |\n")
+                f.write("|" + "|".join(["---"]*len(change_cols)) + "|\n")
+                for _, r in change_df.iterrows():
+                    row = [str(r.get(c, "")) for c in change_cols]
+                    f.write("| " + " | ".join(row) + " |\n")
+
+            f.write("\n\n_This is a lightweight report. Replace with a proper PDF when ready._\n")
+
+        return path
+
+    def run_once(self, csv_path: str) -> Dict[str, str]:
+        run_id = _uuid()
+
+        # 0) Load (kns_core.load_data parses numerics & builds Active_CY)
+        try:
+            df_week = load_data(csv_path)
+        except Exception as e:
+            print(f"[error] Failed to load '{csv_path}': {e}")
+            return {}
+        if df_week is None or df_week.empty:
+            print("[warn] Loaded dataframe is empty.")
+            return {}
+
+        # 1) Defensive: drop duplicate columns
+        df_week = df_week.loc[:, ~df_week.columns.duplicated(keep="last")]
+
+        # 2) Canonical Combo Key for kns_core: "<NPD Cuisine Type>|<Company Name>"
+        df_week["Combo Key"] = (
+            df_week["NPD Cuisine Type"].astype(str) + "|" + df_week["Company Name"].astype(str)
+        )
+
+        # 3) Normalize Zone Suffix to digits (if present)
+        if "Zone Suffix" in df_week.columns:
+            df_week["Zone Suffix"] = (
+                df_week["Zone Suffix"].astype(str).str.extract(r"(\d+)", expand=False)
+            )
+
+        # 4) Ensure Current_Zone (from Price Zone ID or Zone Suffix)
+        if "Current_Zone" not in df_week.columns or df_week["Current_Zone"].isna().to_numpy().any():
+            if "Price Zone ID" in df_week.columns:
+                df_week["Current_Zone"] = (
+                    df_week["Price Zone ID"].astype(str)
+                    .str.split("-", n=1).str[-1]
+                    .str.extract(r"(\d+)", expand=False)
+                )
+            elif "Zone Suffix" in df_week.columns:
+                df_week["Current_Zone"] = df_week["Zone Suffix"]
+            else:
+                df_week["Current_Zone"] = pd.NA
+
+        # 5) Core zone tables & picks (recommended zones)
+        current_map = compute_current_zone(df_week)
+        cust        = customer_totals_and_main_zones(df_week)
+        z_table     = zone_metrics_from_customers(cust)
+        picks       = pick_zones(z_table, current_map, action_keep="Keep", action_change="Change")
+
+        # 6) Attach Rec_Zone to rows
+        rec = picks[["Combo Key","Recommended Zone Suffix"]].rename(
+            columns={"Recommended Zone Suffix":"Rec_Zone"}
+        )
+        df_week = df_week.merge(rec, on="Combo Key", how="left")
+
+        # 6b) Fallback: if no candidates, default to keep current
+        if "Rec_Zone" not in df_week.columns or df_week["Rec_Zone"].isna().all():
+            df_week["Rec_Zone"] = df_week["Current_Zone"]
+
+        # 7) Observe → 8) Reason → 9) Plan
+        df_obs      = self.observer.load_week(df_week)
+        df_reasoned = self.reasoner.reason(df_obs)
+        df_plan     = self.actor.plan(df_reasoned)
+
+        # 10) Audit log
+        self.auditor.log(run_id, df_plan)
+
+        # 11) Export CSVs (summary/actions/defer with goals embedded)
+        paths = self.actor.export(df_plan, self.cfg)
+
+        # 12) Manager report (markdown)
+        try:
+            report_path = self._build_manager_report(df_plan)
+            paths["manager_report"] = report_path
+        except Exception as e:
+            print("Manager report build failed:", e)
+
+        return paths
+
+
+    def record_outcomes(self, df_outcomes: pd.DataFrame) -> None:
+        """After latency window, ingest realized outcomes (post-action).
+        Expected columns: combo_key_hash, action, planned_zone, prev_zone,
+                          observed_margin_delta, observed_volume_delta
+        """
+        if df_outcomes.empty:
+            return
+        df = df_outcomes.copy()
+        df['date'] = datetime.now().strftime('%Y-%m-%d')
+        self.memory.append(df)
+
+    def auto_tune(self) -> Dict[str, int]:
+        """Use Memory to propose new thresholds (no auto-apply by default)."""
+        return self.learner.suggest_thresholds()
+    
+    def export(self, df_planned: pd.DataFrame, cfg: AgentConfig) -> Dict[str, str]:
+        ts = cfg.timestamp
+
+        # Add goals for visibility
+        df_planned = df_planned.copy()
+        df_planned["Goal_Margin_YoY"] = cfg.goal_margin_yoy
+        df_planned["Goal_Volume_YoY"] = cfg.goal_volume_yoy
+
+        paths = {
+            'summary': os.path.join(cfg.outdir, f'KNS_Agent_Summary_{ts}.csv'),
+            'actions': os.path.join(cfg.outdir, f'KNS_Agent_Actions_{ts}.csv'),
+            'defer':   os.path.join(cfg.outdir, f'KNS_Agent_Defer_{ts}.csv'),
+            'audit':   cfg.audit_csv,
+        }
+        df_planned.to_csv(paths['summary'], index=False)
+        df_planned[df_planned['Action'].isin(['Switch','PilotNow','QuickWin'])].to_csv(paths['actions'], index=False)
+        df_planned[df_planned['Action'].isin(['Defer','Keep'])].to_csv(paths['defer'], index=False)
+        return paths
+
+
+
+# ===================== EXAMPLE USAGE =====================
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--watch', action='store_true', help='Watch a folder for new weekly CSVs (file arrival trigger).')
+    parser.add_argument('--watch_dir', type=str, default=os.environ.get('KNS_WATCH_DIR', r'538_Weekly_Folder'))
+    parser.add_argument('--once', type=str, help='Run once on a specific CSV path.')
+    args = parser.parse_args()
+
+    if args.once:
+        agent = KNSAgent(AgentConfig())
+        out_paths = agent.run_once(args.once)
+        print('Exports written to:')
+        for k, p in out_paths.items():
+            print(f' - {k}: {p}')
+        raise SystemExit(0)
+
+
+    if args.watch:
+        try:
+            from watchdog.observers import Observer as FSObserver
+            from watchdog.events import FileSystemEventHandler
+        except ImportError:
+            print('Please pip install watchdog to use --watch')
+            raise SystemExit(1)
+
+        WATCH_DIR = args.watch_dir
+        _ensure_outdir(WATCH_DIR)
+        class WeeklyHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                if not event.is_directory and event.src_path.lower().endswith('.csv'):
+                    print(f"New file detected: {event.src_path}")
+                    try:
+                        agent = KNSAgent(AgentConfig())
+                        out_paths = agent.run_once(event.src_path)
+                        print('Agent run complete. Exports:', out_paths)
+                    except Exception as e:
+                        print('Error running agent:', e)
+        handler = WeeklyHandler()
+        obs = FSObserver()
+        obs.schedule(handler, WATCH_DIR, recursive=False)
+        obs.start()
+        print(f'Watching {WATCH_DIR} for new weekly files...')
+        try:
+            while True:
+                time.sleep(5)
+        except KeyboardInterrupt:
+            obs.stop()
+        obs.join()
+    else:
+        print('Usage: python kns_agent.py --once path.csv | --watch [--watch_dir FOLDER] | --build_demo_pdf')
