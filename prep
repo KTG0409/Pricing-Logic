@@ -1,0 +1,130 @@
+# prep_kns_file.py
+import os, sys, re
+import pandas as pd
+import numpy as np
+
+RAW_COL_ZONE_SUFFIX = "Zone Suffix"          # sometimes appears as "Zone Suffix  "
+RAW_COL_ZONE_SUFFIX_ALT = "Zone Suffix  "
+RAW_COL_PRICE_ZONE = "Price Zone ID"
+
+def to_number(x):
+    """Robust number parser that handles $, commas, parens, %."""
+    if pd.isna(x): return np.nan
+    s = str(x).strip().replace("\u200b", "")
+    if s == "": return np.nan
+    if re.match(r"^\(.*\)$", s): s = "-" + s.strip("()")
+    s = s.replace("$","").replace(",","").replace("%","").strip()
+    try: return float(s)
+    except: return np.nan
+
+def parse_zone_suffix(val):
+    """Extract the numeric suffix from Price Zone ID like '001-3' -> '3'."""
+    if pd.isna(val): return np.nan
+    s = str(val).strip()
+    # if it's already a pure integer-like string, keep it
+    if re.fullmatch(r"\d+", s):
+        return s
+    # if it has a dash, take what's after it (e.g., '001-3' -> '3')
+    if "-" in s:
+        sfx = s.split("-", 1)[1].strip()
+    else:
+        sfx = s
+    # keep only the digits of the suffix
+    m = re.search(r"(\d+)", sfx)
+    return m.group(1) if m else np.nan
+
+def main(in_path, out_path=None):
+    if out_path is None:
+        base, ext = os.path.splitext(in_path)
+        out_path = base + "_prepped" + ext
+
+    # read as strings first; we’ll coerce specific columns later
+    df = pd.read_csv(in_path, dtype=str, low_memory=False)
+    df.columns = df.columns.str.strip()
+
+    # --- 1) Normalize / fix Zone Suffix ---
+    if RAW_COL_ZONE_SUFFIX_ALT in df.columns and RAW_COL_ZONE_SUFFIX not in df.columns:
+        df.rename(columns={RAW_COL_ZONE_SUFFIX_ALT: RAW_COL_ZONE_SUFFIX}, inplace=True)
+
+    # Ensure the column exists and is string dtype
+    if RAW_COL_ZONE_SUFFIX in df.columns:
+        df[RAW_COL_ZONE_SUFFIX] = (
+            df[RAW_COL_ZONE_SUFFIX].apply(parse_zone_suffix).astype("string")
+        )
+    else:
+        df[RAW_COL_ZONE_SUFFIX] = pd.Series(pd.NA, index=df.index, dtype="string")
+
+    # Backfill from Price Zone ID where missing/invalid
+    if RAW_COL_PRICE_ZONE in df.columns:
+        bad = df[RAW_COL_ZONE_SUFFIX].isna() | ~df[RAW_COL_ZONE_SUFFIX].str.fullmatch(r"\d+")
+        if bad.any():
+            fill = df.loc[bad, RAW_COL_PRICE_ZONE].apply(parse_zone_suffix).astype("string")
+            df.loc[bad, RAW_COL_ZONE_SUFFIX] = fill
+
+    # Also make Current_Zone a string
+    if "Current_Zone" not in df.columns:
+        if RAW_COL_PRICE_ZONE in df.columns:
+            df["Current_Zone"] = df[RAW_COL_PRICE_ZONE].apply(parse_zone_suffix).astype("string")
+        else:
+            df["Current_Zone"] = df[RAW_COL_ZONE_SUFFIX]
+
+    # --- 3) Make sure core numeric deltas are numeric ---
+    for col in [
+        "Delta Computer Margin Per LB YoY",  # used by AgentConfig.col_margin_delta
+        "Delta Pounds YoY",                  # used by AgentConfig.col_volume_delta
+        "Computer Margin $ Per LB CY",       # used by guardrail floor (if you have the P25 column too)
+        "Exception Ext % of Net Sales CY",   # may feed Exceptions_Rate
+        "Exceptions_Rate",                   # if present, normalize it
+    ]:
+        if col in df.columns:
+            df[col] = df[col].apply(to_number)
+
+    # Optional: map your file’s exception % column into the agent’s expected column
+    if "Exceptions_Rate" not in df.columns:
+        if "Exception Ext % of Net Sales CY" in df.columns:
+            # convert 5.5 (percent) to 0.055 (rate)
+            df["Exceptions_Rate"] = (df["Exception Ext % of Net Sales CY"] / 100.0).astype(float)
+        else:
+            df["Exceptions_Rate"] = np.nan
+
+    # --- 4) Build leader-friendly key (names, not numbers) ---
+    # the agent also uses kns_core which builds a separate "Combo Key"; this is just for readability
+    needed = ["Attribute Group Name", "NPD Cuisine Type", "Company Name"]
+    if all(col in df.columns for col in needed):
+        df["Combo_Key_Human"] = (
+            df["Attribute Group Name"].astype(str).str.strip().str.upper() + "::" +
+            df["NPD Cuisine Type"].astype(str).str.strip().str.upper()    + "::" +
+            df["Company Name"].astype(str).str.strip().str.upper()
+        )
+
+    # --- 5) kns_core expects these columns (it will also create them if absent, but let’s help it) ---
+    # a) Combo Key for zoning: "<NPD Cuisine Type>|<Company Name>"
+    if "Combo Key" not in df.columns and "NPD Cuisine Type" in df.columns and "Company Name" in df.columns:
+        df["Combo Key"] = df["NPD Cuisine Type"].astype(str) + "|" + df["Company Name"].astype(str)
+
+    # b) Active_CY (boolean) -> used by kns_core.compute_current_zone
+    # kns_core will compute it too, but ensuring it here avoids surprises
+    if "Pounds CY" in df.columns:
+        cy = df["Pounds CY"].apply(to_number).fillna(0)
+        df["Active_CY"] = cy > 0
+
+    # c) Optional default columns the agent reads
+    if "Weeks_Observed" not in df.columns:
+        df["Weeks_Observed"] = 0
+    if "Exceptions_Flag" not in df.columns:
+        df["Exceptions_Flag"] = 0
+    if "Evidence_Active_Customers_RecZone" not in df.columns:
+        df["Evidence_Active_Customers_RecZone"] = np.nan  # agent later fills from picks merge
+
+    # Write out
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"✅ Prepped file saved to: {out_path}")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python prep_kns_file.py <raw.csv> [out.csv]")
+        sys.exit(1)
+    in_path = sys.argv[1]
+    out_path = sys.argv[2] if len(sys.argv) > 2 else None
+    main(in_path, out_path)
